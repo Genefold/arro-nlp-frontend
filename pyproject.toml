@@ -1,0 +1,42 @@
+[project]
+name = "arro-nlp-frontend"
+version = "0.1.0"
+description = "OpenAI-like FastAPI server: embeds queries and proxies vector search via arro-server"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Genefold" },
+]
+
+dependencies = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.29",
+    "httpx>=0.27",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
+    "sentence-transformers>=3.0",
+    "openai>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",   # also used as async test client
+]
+
+[project.scripts]
+arro-nlp-frontend = "arro_nlp_frontend.main:run"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arro_nlp_frontend"]
