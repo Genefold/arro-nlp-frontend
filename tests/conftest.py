@@ -5,7 +5,6 @@ All fixtures are offline — no arro-server, no HF Hub downloads at test time
 """
 from __future__ import annotations
 
-import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 

@@ -79,7 +79,8 @@ class Embedder:
                 p = Path(model_path)
                 if not p.exists():
                     raise FileNotFoundError(
-                        f"EMBEDDER_MODEL_PATH is set but the directory does not exist: {model_path}\n"
+                        "EMBEDDER_MODEL_PATH is set but the directory does not exist: "
+                        f"{model_path}\n"
                         "Fix: either create the directory or unset EMBEDDER_MODEL_PATH."
                     )
                 if not p.is_dir():
@@ -93,7 +94,7 @@ class Embedder:
             raise ValueError(f"backend must be 'local' or 'openai', got {backend!r}")
 
     @classmethod
-    def from_settings(cls) -> "Embedder":
+    def from_settings(cls) -> Embedder:
         """Construct from arro_nlp_frontend.config.settings singleton."""
         from arro_nlp_frontend.config import settings
 

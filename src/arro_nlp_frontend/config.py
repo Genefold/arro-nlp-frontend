@@ -63,7 +63,7 @@ class Settings(BaseSettings):
         return v
 
     @model_validator(mode="after")
-    def _openai_needs_key(self) -> "Settings":
+    def _openai_needs_key(self) -> Settings:
         if self.embed_backend == "openai" and not self.openai_api_key:
             raise ValueError("OPENAI_API_KEY is required when EMBED_BACKEND=openai")
         return self

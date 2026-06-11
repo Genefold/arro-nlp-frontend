@@ -1,0 +1,53 @@
+name: lint
+
+on:
+  push:
+    branches: [feature/embedder, main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/uv-installation@v2
+        with:
+          version: "latest"
+
+      - name: Install pre-commit
+        run: |
+          uv pip install pre-commit
+
+      - name: Cache pre-commit hooks
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-3.11-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            pre-commit-3.11-
+            pre-commit-
+
+      - name: Run pre-commit
+        run: |
+          uv run pre-commit run --all-files --show-diff-on-failure || true
+
+      - name: Run ruff
+        run: |
+          uv run ruff check src/ tests/
+
+      - name: Run mypy
+        run: |
+          uv run mypy src/ tests/
