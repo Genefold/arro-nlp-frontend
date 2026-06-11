@@ -40,12 +40,18 @@ class TestEmbedderLocal:
         assert 0.5 < norm < 2.0, f"Expected scaled norm near 1.0, got {norm:.3f}"
 
     def test_not_unit_normalised(self, local_embedder):
-        vecs = local_embedder.encode_batch(["remote code execution"])
-        norm = float(np.linalg.norm(vecs[0]))
-        # MiniLM without normalisation gives vectors with norm very close to 1
-        # due to the model's design. They are not L2 normalised in our code,
-        # but the raw output happens to have ~unit norm.
-        assert 0.1 < norm < 5.0, "Norm must be reasonable for MiniLM raw output"
+        """encode_batch must NOT call normalize_embeddings=True.
+        Two semantically different texts produce vectors with different norms;
+        normalised vectors would all have norm exactly 1.0."""
+        vecs = local_embedder.encode_batch([
+            "remote code execution via buffer overflow",
+            "x",
+        ])
+        norm_a = float(np.linalg.norm(vecs[0]))
+        norm_b = float(np.linalg.norm(vecs[1]))
+        assert norm_a != norm_b or abs(norm_a - 1.0) > 1e-6, (
+            "Vectors appear to be L2-normalised — check normalize_embeddings=False"
+        )
 
     def test_deterministic(self, local_embedder):
         text = ["use-after-free in browser renderer"]

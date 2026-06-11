@@ -25,7 +25,6 @@ def local_embedder() -> Embedder:
 def app_client(local_embedder: Embedder) -> Generator[TestClient, None, None]:
     """FastAPI TestClient with embedder pre-loaded in app.state."""
     app = create_app()
-    # Pre-inject embedder so startup event is not needed in sync tests
-    with TestClient(app) as client:
-        app.state.embedder = local_embedder
+    app.state.embedder = local_embedder  # inject before startup fires
+    with TestClient(app, raise_server_exceptions=True) as client:
         yield client
