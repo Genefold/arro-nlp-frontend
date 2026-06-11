@@ -44,6 +44,14 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/arro_nlp_frontend"]
 
+# Required for uv workspace editable installs with src layout.
+# When arro-cve-search installs this as a workspace member, uv reads
+# this flag and delegates to the build backend (hatchling) which knows
+# packages are under src/. Without this, uv skips the build backend
+# and cannot locate the arro_nlp_frontend import root.
+[tool.uv]
+package = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
