@@ -4,6 +4,7 @@ This is the scaffold for the arro-nlp-frontend server.
 Endpoints (search, embed, health) will be added in the next phase.
 The Embedder is instantiated once at startup and injected via app.state.
 """
+
 from __future__ import annotations
 
 import logging

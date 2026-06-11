@@ -8,3 +8,7 @@ dist/
 .pytest_cache/
 data/models/
 .DS_Store
+.mypy_cache/
+.pytype/
+.coverage
+.ruff_cache/

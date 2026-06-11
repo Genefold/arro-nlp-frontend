@@ -1,4 +1,5 @@
 """Tests for arro_nlp_frontend.config."""
+
 import pytest
 from pydantic import ValidationError
 
