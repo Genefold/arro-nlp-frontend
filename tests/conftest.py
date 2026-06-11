@@ -3,7 +3,10 @@
 All fixtures are offline — no arro-server, no HF Hub downloads at test time
 (sentence-transformers caches the model after first download).
 """
+
 from __future__ import annotations
+
+from collections.abc import Generator
 
 import pytest
 from fastapi.testclient import TestClient
@@ -19,7 +22,7 @@ def local_embedder() -> Embedder:
 
 
 @pytest.fixture(scope="session")
-def app_client(local_embedder: Embedder) -> TestClient:
+def app_client(local_embedder: Embedder) -> Generator[TestClient, None, None]:
     """FastAPI TestClient with embedder pre-loaded in app.state."""
     app = create_app()
     # Pre-inject embedder so startup event is not needed in sync tests

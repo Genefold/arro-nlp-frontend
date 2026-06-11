@@ -9,6 +9,7 @@ Usage:
     from arro_nlp_frontend.config import settings
     print(settings.embed_backend)
 """
+
 from __future__ import annotations
 
 from pydantic import field_validator, model_validator

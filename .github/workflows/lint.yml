@@ -27,26 +27,23 @@ jobs:
         with:
           version: "latest"
 
-      - name: Install pre-commit
+      - name: Install dependencies
         run: |
-          uv pip install pre-commit
+          uv sync --frozen --all-extras
 
       - name: Cache pre-commit hooks
         uses: actions/cache@v4
         with:
           path: ~/.cache/pre-commit
           key: pre-commit-3.11-${{ hashFiles('.pre-commit-config.yaml') }}
-          restore-keys: |
-            pre-commit-3.11-
-            pre-commit-
 
-      - name: Run pre-commit
-        run: |
-          uv run pre-commit run --all-files --show-diff-on-failure || true
-
-      - name: Run ruff
+      - name: Run ruff linter
         run: |
           uv run ruff check src/ tests/
+
+      - name: Run ruff formatter check
+        run: |
+          uv run ruff format --check src/ tests/
 
       - name: Run mypy
         run: |

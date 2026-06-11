@@ -1,4 +1,5 @@
 """Smoke tests for the FastAPI application scaffold."""
+
 from __future__ import annotations
 
 from arro_nlp_frontend.main import create_app

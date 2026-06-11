@@ -2,6 +2,7 @@
 
 All tests run fully offline — no HF Hub downloads after first run, no arro-server.
 """
+
 from __future__ import annotations
 
 import numpy as np

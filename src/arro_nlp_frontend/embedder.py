@@ -15,6 +15,7 @@ Backend resolution order:
   3. model_path empty, backend=local          → SentenceTransformer(model) via HF Hub
   4. backend=openai                           → OpenAI Embeddings API
 """
+
 from __future__ import annotations
 
 import logging
@@ -110,7 +111,7 @@ class Embedder:
     def dim(self) -> int:
         """Output dimension. 384 for all-MiniLM-L6-v2 family."""
         if self._model is not None:
-            return self._model.get_sentence_embedding_dimension()  # type: ignore[union-attr]
+            return int(self._model.get_embedding_dimension())  # type: ignore[union-attr]
         return 384  # pragma: no cover — openai dim depends on model
 
     def encode_batch(self, texts: list[str]) -> np.ndarray:
@@ -125,9 +126,7 @@ class Embedder:
 
         if self.backend == "openai":
             assert self._client is not None
-            response = self._client.embeddings.create(
-                model=self.model_name, input=texts
-            )
+            response = self._client.embeddings.create(model=self.model_name, input=texts)
             raw = np.array([d.embedding for d in response.data], dtype=np.float64)
         else:
             assert self._model is not None
