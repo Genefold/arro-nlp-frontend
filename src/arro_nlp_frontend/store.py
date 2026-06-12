@@ -37,7 +37,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -139,7 +139,7 @@ class DocumentStore:
             raise ValueError("start_row must be >= 0")
 
         # ingested_at is always set server-side; caller-supplied value is ignored.
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         batch_data = [
             (
                 start_row + i,
@@ -183,8 +183,7 @@ class DocumentStore:
         """Return the document with the given doc_id, or None if not found."""
         assert self._conn is not None
         cursor = self._conn.execute(
-            "SELECT row_index, doc_id, text, metadata, ingested_at"
-            " FROM documents WHERE doc_id = ?",
+            "SELECT row_index, doc_id, text, metadata, ingested_at FROM documents WHERE doc_id = ?",
             (doc_id,),
         )
         row = cursor.fetchone()
@@ -202,9 +201,7 @@ class DocumentStore:
         Returns True if a row was deleted, False if doc_id was not found.
         """
         assert self._conn is not None
-        cursor = self._conn.execute(
-            "DELETE FROM documents WHERE doc_id = ?", (doc_id,)
-        )
+        cursor = self._conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
         self._conn.commit()
         return cursor.rowcount > 0
 
@@ -218,9 +215,7 @@ class DocumentStore:
         Returns 0 if the store is empty.
         """
         assert self._conn is not None
-        cursor = self._conn.execute(
-            "SELECT COALESCE(MAX(row_index) + 1, 0) FROM documents"
-        )
+        cursor = self._conn.execute("SELECT COALESCE(MAX(row_index) + 1, 0) FROM documents")
         return int(cursor.fetchone()[0])
 
     def count(self) -> int:
@@ -256,7 +251,5 @@ class DocumentStore:
             doc_id=doc_id,
             text=text,
             metadata=json.loads(metadata_json),
-            ingested_at=(
-                datetime.fromisoformat(ingested_at_iso) if ingested_at_iso else None
-            ),
+            ingested_at=(datetime.fromisoformat(ingested_at_iso) if ingested_at_iso else None),
         )
