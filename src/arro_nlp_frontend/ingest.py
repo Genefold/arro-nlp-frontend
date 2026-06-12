@@ -1,6 +1,6 @@
 """POST /ingest endpoint: embed documents and push vectors to arro-server.
 
-Pipeline: validate -> embed -> lock -> next_row_index -> push -> persist -> respond.
+Pipeline: validate -> embed -> check existing -> lock -> next_row_index -> push -> persist.
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ async def ingest(
     production deployments, a database-level advisory lock or a serialised
     ingest queue is required.
 
-    Pipeline (all steps inside the lock):
+    Pipeline (steps 3-5 inside the lock):
       1. Validate: non-empty list, no duplicate doc_ids within the batch
       2. Embed texts -> float64 array shape (N, dim)
       3. start_row = store.next_row_index()   <- MAX(row_index)+1, not COUNT
@@ -76,29 +76,46 @@ async def ingest(
     store = req.app.state.store
     arro_client = req.app.state.arro_client
 
+    # Step 1 — validate: no duplicate doc_ids within this batch
     doc_ids = [item.doc_id for item in request.documents]
     if len(doc_ids) != len(set(doc_ids)):
-        duplicates = [id for id in doc_ids if doc_ids.count(id) > 1]
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for d in doc_ids:
+            if d in seen:
+                duplicates.append(d)
+            seen.add(d)
         raise HTTPException(
             status_code=422,
-            detail=f"Duplicate doc_ids in request: {list(set(duplicates))}",
+            detail=f"Duplicate doc_ids in request: {duplicates}",
         )
 
+    # Step 2 — embed (outside lock: pure CPU/IO, does not touch shared state)
     texts = [item.text for item in request.documents]
     vectors = embedder.encode_batch(texts)
 
-    statuses: list[Literal["created", "updated"]] = []
-    for item in request.documents:
-        existing = store.get_by_id(item.doc_id)
-        statuses.append("updated" if existing is not None else "created")
+    # Snapshot "created" vs "updated" status before acquiring the lock.
+    # This read is outside the lock intentionally: it is informational only
+    # and does not affect index correctness. A race here would change a
+    # status label, not corrupt data.
+    statuses: list[Literal["created", "updated"]] = [
+        "updated" if store.get_by_id(item.doc_id) is not None else "created"
+        for item in request.documents
+    ]
 
+    # Steps 3-5 — inside the lock: start_row is stable for the duration
+    start_row: int = 0
     async with req.app.state.ingest_lock:
         start_row = store.next_row_index()
+
         try:
             await arro_client.push_vectors(vectors, start_row)
         except ArroServerError as exc:
-            logger.error("[ingest] arro-server push failed: %s", exc)
-            raise HTTPException(status_code=502, detail=f"arro-server error: {exc}") from exc
+            logger.error("[ingest] arro-server push failed at start_row=%d: %s", start_row, exc)
+            raise HTTPException(
+                status_code=502,
+                detail=f"arro-server error: {exc}",
+            ) from exc
 
         documents = [
             Document(
@@ -113,6 +130,12 @@ async def ingest(
         store.upsert_batch(start_row, documents)
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    logger.info(
+        "[ingest] ingested %d docs start_row=%d elapsed=%dms",
+        len(documents),
+        start_row,
+        elapsed_ms,
+    )
 
     results = [
         IngestResult(
