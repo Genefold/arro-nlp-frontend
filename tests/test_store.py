@@ -261,7 +261,9 @@ def test_store_count_total_vs_per_dataset(tmp_path: Path) -> None:
     """count() scoped to dataset vs global."""
     store = DocumentStore(tmp_path / "docs.sqlite")
     store.upsert_batch("ds/a", 0, [_make_doc(0, "a0"), _make_doc(1, "a1")], _vecs(2))
-    store.upsert_batch("ds/b", 0, [_make_doc(0, "b0"), _make_doc(1, "b1"), _make_doc(2, "b2")], _vecs(3))
+    store.upsert_batch(
+        "ds/b", 0, [_make_doc(0, "b0"), _make_doc(1, "b1"), _make_doc(2, "b2")], _vecs(3)
+    )
 
     assert store.count("ds/a") == 2
     assert store.count("ds/b") == 3

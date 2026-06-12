@@ -37,7 +37,9 @@ DEFAULT_DS = "test/dataset"
 # ---------------------------------------------------------------------------
 
 
-def _post(client, query: str, dataset_id: str = DEFAULT_DS, top_k: int = 10, tau: float | None = None):
+def _post(
+    client, query: str, dataset_id: str = DEFAULT_DS, top_k: int = 10, tau: float | None = None
+):
     body: dict = {"dataset_id": dataset_id, "query": query, "top_k": top_k}
     if tau is not None:
         body["tau"] = tau
@@ -137,9 +139,9 @@ def test_search_rank_resequenced_after_ghost_skips(search_client):
     _seed_store(store, [(0, "doc0", "first"), (2, "doc2", "third")])
     mock_arro.search = AsyncMock(
         return_value=[
-            SearchHit(index=0, score=0.9),   # found
-            SearchHit(index=1, score=0.7),   # ghost -- row 1 not in store
-            SearchHit(index=2, score=0.5),   # found
+            SearchHit(index=0, score=0.9),  # found
+            SearchHit(index=1, score=0.7),  # ghost -- row 1 not in store
+            SearchHit(index=2, score=0.5),  # found
         ],
     )
 
@@ -243,9 +245,7 @@ def test_search_dataset_isolation(search_client):
     _seed_store(store, [(0, "doc-a", "buffer overflow")], dataset_id="ds/a")
     _seed_store(store, [(0, "doc-b", "sql injection")], dataset_id="ds/b")
 
-    mock_arro.search = AsyncMock(
-        return_value=[SearchHit(index=0, score=0.9)]
-    )
+    mock_arro.search = AsyncMock(return_value=[SearchHit(index=0, score=0.9)])
 
     r_a = _post(client, "overflow", dataset_id="ds/a")
     assert r_a.status_code == 200

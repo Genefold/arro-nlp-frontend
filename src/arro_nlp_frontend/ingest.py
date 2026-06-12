@@ -80,13 +80,26 @@ async def ingest(
     production deployments, a database-level advisory lock or a serialised
     ingest queue is required.
 
+    LOCK IS GLOBAL ACROSS ALL DATASETS.
+    The lock is a single asyncio.Lock shared by all datasets. Two concurrent
+    ingest requests targeting different dataset_ids (e.g. 'ds/a' and 'ds/b')
+    will queue behind the same lock. This is safe and correct: each dataset
+    has an independent row_index counter and an independent Zarr array, so
+    there is no correctness reason for the shared lock -- it is a throughput
+    limitation. Under this design, ingest throughput for N datasets is the
+    same as for 1 dataset: fully serialised.
+
+    If per-dataset parallelism is required in future, replace the single
+    asyncio.Lock with a dict[str, asyncio.Lock] keyed by dataset_id. That
+    change requires its own spec and test coverage before implementation.
+
     Pipeline:
       1. Validate: non-empty list, no duplicate doc_ids within the batch
       2. Embed texts in chunks of EMBED_CHUNK -> float64 array (N, dim)
-      3. (inside lock) start_row = store.next_row_index()
+      3. (inside lock) start_row = store.next_row_index(dataset_id)
       4. (inside lock) upsert_batch into SQLite with vectors
       5. (inside lock) Sync to arro-server:
-         a. Read ALL vectors from SQLite (full matrix)
+         a. Read ALL vectors from SQLite for this dataset (full matrix)
          b. Check if dataset exists (dataset_metadata -> 404 = new)
          c. upload_init -> upload_path
          d. Write Zarr v3 array to upload_path

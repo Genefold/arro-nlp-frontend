@@ -131,9 +131,7 @@ def test_ingest_arro_sync_called(ingest_client):
         _post(client, [{"doc_id": "doc0", "text": "hello"}])
 
     mock_arro.dataset_metadata.assert_called_once_with(dataset_id=DEFAULT_DS)
-    mock_arro.upload_init.assert_called_once_with(
-        dataset_id=DEFAULT_DS, root_label="main"
-    )
+    mock_arro.upload_init.assert_called_once_with(dataset_id=DEFAULT_DS, root_label="main")
     mock_arro.upload_commit.assert_called_once()
     mock_arro.build_index.assert_not_called()
     assert len(written) == 1
@@ -235,7 +233,10 @@ def test_ingest_concurrent_batches_no_row_overlap(tmp_path: Path) -> None:
             with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open_zarr):
                 r = await c.post(
                     "/ingest",
-                    json={"dataset_id": DEFAULT_DS, "documents": [{"doc_id": doc_id, "text": "text"}]},
+                    json={
+                        "dataset_id": DEFAULT_DS,
+                        "documents": [{"doc_id": doc_id, "text": "text"}],
+                    },
                 )
             assert r.status_code == 200, f"Unexpected {r.status_code}: {r.text}"
             return [x["row_index"] for x in r.json()["results"]]
@@ -388,9 +389,7 @@ def test_ingest_root_label_override_forwarded(ingest_client):
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         _post(client, [{"doc_id": "doc0", "text": "hello"}], root_label="staging")
 
-    mock_arro.upload_init.assert_called_once_with(
-        dataset_id=DEFAULT_DS, root_label="staging"
-    )
+    mock_arro.upload_init.assert_called_once_with(dataset_id=DEFAULT_DS, root_label="staging")
 
 
 def test_ingest_root_label_defaults_to_settings(ingest_client):
