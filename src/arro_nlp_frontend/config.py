@@ -26,7 +26,6 @@ class Settings(BaseSettings):
 
     # ── arro-server ────────────────────────────────────────────────────────────
     arro_server_url: str = "http://localhost:8001"
-    arro_server_dataset_id: str = "cve/embeddings"
     arro_server_root_label: str = "main"
     arro_server_upload_path: str = ""
     """Override the upload path returned by /api/upload/init.

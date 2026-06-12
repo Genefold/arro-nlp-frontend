@@ -14,6 +14,9 @@ Test inventory:
   9.  test_search_default_tau_from_settings
   10. test_search_empty_results_from_arro
   11. test_search_query_time_ms_present
+  12. test_search_dataset_isolation
+  13. test_search_missing_dataset_id_422
+  14. test_search_dataset_id_forwarded_to_arro_client
 """
 
 from __future__ import annotations
@@ -27,19 +30,21 @@ import pytest
 from arro_nlp_frontend.arro_client import ArroServerError, SearchHit
 from arro_nlp_frontend.store import Document
 
+DEFAULT_DS = "test/dataset"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _post(client, query: str, top_k: int = 10, tau: float | None = None):
-    body: dict = {"query": query, "top_k": top_k}
+def _post(client, query: str, dataset_id: str = DEFAULT_DS, top_k: int = 10, tau: float | None = None):
+    body: dict = {"dataset_id": dataset_id, "query": query, "top_k": top_k}
     if tau is not None:
         body["tau"] = tau
     return client.post("/search", json=body)
 
 
-def _seed_store(store, docs: list[tuple[int, str, str]]) -> None:
+def _seed_store(store, docs: list[tuple[int, str, str]], dataset_id: str = DEFAULT_DS) -> None:
     """Insert documents at their exact row_index.
 
     Each (row_index, doc_id, text) tuple is inserted independently so
@@ -55,7 +60,7 @@ def _seed_store(store, docs: list[tuple[int, str, str]]) -> None:
             metadata={},
             ingested_at=datetime.now(UTC),
         )
-        store.upsert_batch(row, [doc], np.zeros((1, 384), dtype=np.float64))
+        store.upsert_batch(dataset_id, row, [doc], np.zeros((1, 384), dtype=np.float64))
 
 
 # ---------------------------------------------------------------------------
@@ -225,3 +230,47 @@ def test_search_default_tau_from_settings(search_client):
 
     call_kwargs = mock_arro.search.call_args.kwargs
     assert call_kwargs["tau"] == pytest.approx(settings.arro_server_search_tau)
+
+
+# ---------------------------------------------------------------------------
+# Multi-dataset tests
+# ---------------------------------------------------------------------------
+
+
+def test_search_dataset_isolation(search_client):
+    """Search within one dataset does not return results from another."""
+    client, store, mock_arro = search_client
+    _seed_store(store, [(0, "doc-a", "buffer overflow")], dataset_id="ds/a")
+    _seed_store(store, [(0, "doc-b", "sql injection")], dataset_id="ds/b")
+
+    mock_arro.search = AsyncMock(
+        return_value=[SearchHit(index=0, score=0.9)]
+    )
+
+    r_a = _post(client, "overflow", dataset_id="ds/a")
+    assert r_a.status_code == 200
+    assert r_a.json()["results"][0]["doc_id"] == "doc-a"
+
+    r_b = _post(client, "injection", dataset_id="ds/b")
+    assert r_b.status_code == 200
+    assert r_b.json()["results"][0]["doc_id"] == "doc-b"
+
+
+def test_search_missing_dataset_id_422(search_client):
+    """Request without dataset_id returns 422."""
+    client, _, _ = search_client
+    r = client.post("/search", json={"query": "test", "top_k": 10})
+    assert r.status_code == 422
+
+
+def test_search_dataset_id_forwarded_to_arro_client(search_client):
+    """dataset_id from request is forwarded to arro_client.search."""
+    client, _, mock_arro = search_client
+    mock_arro.search = AsyncMock(return_value=[])
+
+    _post(client, "query", dataset_id="nvd/embeddings")
+
+    mock_arro.search.assert_called_once()
+    call_args = mock_arro.search.call_args
+    assert "dataset_id" in call_args.kwargs
+    assert call_args.kwargs["dataset_id"] == "nvd/embeddings"
