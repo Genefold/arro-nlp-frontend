@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     arro_server_dataset_id: str = "cve/embeddings"
     arro_server_search_tau: float = 0.42
 
+    # ── Document store ─────────────────────────────────────────────────────────
+    store_db_path: str = "./data/documents.sqlite"
+
     # ── Server ─────────────────────────────────────────────────────────────────
     host: str = "0.0.0.0"
     port: int = 8000
