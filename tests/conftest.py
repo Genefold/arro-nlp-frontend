@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from arro_nlp_frontend.arro_client import ArroClient
+from arro_nlp_frontend.arro_client import ArroClient, UploadCommitResult
 from arro_nlp_frontend.embedder import Embedder
 from arro_nlp_frontend.main import create_app
 from arro_nlp_frontend.store import DocumentStore
@@ -40,6 +40,7 @@ async def _noop_lifespan(app):
 # Shared singletons (session-scoped to avoid re-downloading the model)
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="session")
 def local_embedder() -> Embedder:
     """Real all-MiniLM-L6-v2 embedder. Downloaded once, cached by sentence-transformers."""
@@ -50,6 +51,7 @@ def local_embedder() -> Embedder:
 # Per-test fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def store(tmp_path: Path) -> Generator[DocumentStore, None, None]:
     """DocumentStore backed by a temp SQLite file, closed after each test."""
@@ -59,10 +61,14 @@ def store(tmp_path: Path) -> Generator[DocumentStore, None, None]:
 
 @pytest.fixture
 def mock_arro_client() -> AsyncMock:
-    """AsyncMock with push_vectors and row_count pre-configured."""
+    """AsyncMock with new ArroClient methods pre-configured."""
     client = AsyncMock(spec=ArroClient)
-    client.push_vectors = AsyncMock(return_value=None)
-    client.row_count = AsyncMock(return_value=0)
+    client.dataset_metadata = AsyncMock(return_value=None)
+    client.upload_init = AsyncMock(return_value="/tmp/arro_test_upload.zarr")
+    client.upload_commit = AsyncMock(
+        return_value=UploadCommitResult(index_stale=False, shape=[0, 384])
+    )
+    client.build_index = AsyncMock(return_value=None)
     return client
 
 
@@ -96,6 +102,7 @@ def app_client(local_embedder: Embedder) -> Generator[TestClient, None, None]:
     our impl, so we use a tmp dir via tempfile).
     """
     import tempfile
+
     with tempfile.TemporaryDirectory() as tmpdir:
         with patch("arro_nlp_frontend.main.lifespan", _noop_lifespan):
             app = create_app()

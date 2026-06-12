@@ -27,10 +27,15 @@ class Settings(BaseSettings):
     # ── arro-server ────────────────────────────────────────────────────────────
     arro_server_url: str = "http://localhost:8001"
     arro_server_dataset_id: str = "cve/embeddings"
+    arro_server_root_label: str = "main"
+    arro_server_upload_path: str = ""
     arro_server_search_tau: float = 0.42
 
     # ── Document store ─────────────────────────────────────────────────────────
     store_db_path: str = "./data/documents.sqlite"
+
+    # ── Ingest ─────────────────────────────────────────────────────────────────
+    ingest_batch_size: int = 100
 
     # ── Server ─────────────────────────────────────────────────────────────────
     host: str = "0.0.0.0"

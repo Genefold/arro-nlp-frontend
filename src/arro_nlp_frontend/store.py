@@ -39,6 +39,9 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,7 @@ CREATE TABLE IF NOT EXISTS documents (
     row_index   INTEGER PRIMARY KEY,
     doc_id      TEXT    NOT NULL UNIQUE,
     text        TEXT    NOT NULL,
+    vector      BLOB    NOT NULL,
     metadata    TEXT    NOT NULL DEFAULT '{}',
     ingested_at TEXT    NOT NULL
 );
@@ -117,7 +121,12 @@ class DocumentStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.commit()
 
-    def upsert_batch(self, start_row: int, docs: list[Document]) -> None:
+    def upsert_batch(
+        self,
+        start_row: int,
+        docs: list[Document],
+        vectors: np.ndarray,
+    ) -> list[Literal["created", "updated"]]:
         """Atomically insert or replace documents starting at start_row.
 
         Row indices are assigned as start_row, start_row+1, ..., start_row+N-1.
@@ -128,15 +137,22 @@ class DocumentStore:
         ----------
         start_row: First row index to assign. Must be >= 0.
         docs:      Non-empty list of Document objects.
+        vectors:   Float64 array of shape (N, dim). Must match len(docs).
+
+        Returns
+        -------
+        List of "created" or "updated" per document.
 
         Raises
         ------
-        ValueError: If docs is empty.
+        ValueError: If docs is empty or vectors shape mismatch.
         """
         if not docs:
             raise ValueError("docs cannot be empty")
         if start_row < 0:  # pragma: no cover
             raise ValueError("start_row must be >= 0")
+        if len(docs) != vectors.shape[0]:
+            raise ValueError(f"vectors shape {vectors.shape} does not match doc count {len(docs)}")
 
         # ingested_at is always set server-side; caller-supplied value is ignored.
         now = datetime.now(UTC).isoformat()
@@ -145,19 +161,25 @@ class DocumentStore:
                 start_row + i,
                 doc.doc_id,
                 doc.text,
+                vectors[i].tobytes(),
                 json.dumps(doc.metadata),  # plain str, not Binary
                 now,
             )
             for i, doc in enumerate(docs)
         ]
 
+        # Determine created vs updated before the INSERT.
+        statuses: list[Literal["created", "updated"]] = []
+        for doc in docs:
+            statuses.append("updated" if self.get_by_id(doc.doc_id) else "created")
+
         assert self._conn is not None
         with self._conn:
             self._conn.executemany(
                 """
                 INSERT OR REPLACE INTO documents
-                    (row_index, doc_id, text, metadata, ingested_at)
-                VALUES (?, ?, ?, ?, ?)
+                    (row_index, doc_id, text, vector, metadata, ingested_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 batch_data,
             )
@@ -167,6 +189,8 @@ class DocumentStore:
             len(docs),
             start_row,
         )
+
+        return statuses
 
     def get_by_row(self, row_index: int) -> Document | None:
         """Return the document at row_index, or None if not found."""
@@ -223,6 +247,20 @@ class DocumentStore:
         assert self._conn is not None
         cursor = self._conn.execute("SELECT COUNT(*) FROM documents")
         return int(cursor.fetchone()[0])
+
+    def get_all_vectors(self) -> np.ndarray:
+        """Return all vectors as a (N, dim) float64 array ordered by row_index.
+
+        Used to reconstruct the full Zarr dataset for upload to arro-server.
+        Returns empty array of shape (0,) if store is empty.
+        """
+        assert self._conn is not None
+        cursor = self._conn.execute("SELECT vector FROM documents ORDER BY row_index")
+        rows = cursor.fetchall()
+        if not rows:
+            return np.array([], dtype=np.float64)
+        vectors = [np.frombuffer(row[0], dtype=np.float64) for row in rows]
+        return np.stack(vectors)
 
     def close(self) -> None:
         """Close the underlying SQLite connection."""

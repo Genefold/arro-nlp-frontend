@@ -1,6 +1,7 @@
-"""POST /ingest endpoint: embed documents and push vectors to arro-server.
+"""POST /ingest endpoint: embed, store in SQLite, and sync to arro-server via Zarr.
 
-Pipeline: validate -> embed -> check existing -> lock -> next_row_index -> push -> persist.
+Pipeline: validate -> embed (chunked) -> lock -> next_row_index -> persist ->
+          read all vectors -> Zarr rewrite -> upload_commit -> build_index.
 """
 
 from __future__ import annotations
@@ -9,15 +10,20 @@ import logging
 import time
 from typing import Literal
 
+import numpy as np
+import zarr
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from arro_nlp_frontend.arro_client import ArroServerError
+from arro_nlp_frontend.config import settings
 from arro_nlp_frontend.store import Document
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+EMBED_CHUNK = settings.ingest_batch_size
 
 
 class IngestItem(BaseModel):
@@ -49,7 +55,7 @@ async def ingest(
     request: IngestRequest,
     req: Request,
 ) -> IngestResponse:
-    """Ingest documents: embed -> push to arro-server -> persist in store.
+    """Ingest documents: embed -> store in SQLite -> Zarr rewrite -> index.
 
     SINGLE-PROCESS GUARANTEE ONLY.
     The asyncio.Lock prevents row index corruption under concurrent async
@@ -58,13 +64,18 @@ async def ingest(
     production deployments, a database-level advisory lock or a serialised
     ingest queue is required.
 
-    Pipeline (steps 3-5 inside the lock):
+    Pipeline:
       1. Validate: non-empty list, no duplicate doc_ids within the batch
-      2. Embed texts -> float64 array shape (N, dim)
-      3. start_row = store.next_row_index()   <- MAX(row_index)+1, not COUNT
-      4. Push vectors to arro-server          <- if this fails -> 502, no store write
-      5. Persist documents in store           <- upsert_batch(start_row, docs)
-      6. Return IngestResponse
+      2. Embed texts in chunks of EMBED_CHUNK -> float64 array (N, dim)
+      3. (inside lock) start_row = store.next_row_index()
+      4. (inside lock) upsert_batch into SQLite with vectors
+      5. (inside lock) Sync to arro-server:
+         a. Read ALL vectors from SQLite (full matrix)
+         b. Check if dataset exists (dataset_metadata -> 404 = new)
+         c. upload_init -> upload_path
+         d. Write Zarr v3 array to upload_path
+         e. upload_commit -> index_stale
+         f. If index_stale or new dataset -> build_index
 
     Raises:
       422: duplicate doc_ids within the batch
@@ -90,32 +101,15 @@ async def ingest(
             detail=f"Duplicate doc_ids in request: {duplicates}",
         )
 
-    # Step 2 — embed (outside lock: pure CPU/IO, does not touch shared state)
+    # Step 2 — embed in chunks to avoid OOM on large requests
     texts = [item.text for item in request.documents]
-    vectors = embedder.encode_batch(texts)
-
-    # Snapshot "created" vs "updated" status before acquiring the lock.
-    # This read is outside the lock intentionally: it is informational only
-    # and does not affect index correctness. A race here would change a
-    # status label, not corrupt data.
-    statuses: list[Literal["created", "updated"]] = [
-        "updated" if store.get_by_id(item.doc_id) is not None else "created"
-        for item in request.documents
-    ]
+    chunks = [texts[i : i + EMBED_CHUNK] for i in range(0, len(texts), EMBED_CHUNK)]
+    parts = [embedder.encode_batch(chunk) for chunk in chunks]
+    vectors = np.vstack(parts) if len(parts) > 1 else parts[0]
 
     # Steps 3-5 — inside the lock: start_row is stable for the duration
-    start_row: int = 0
     async with req.app.state.ingest_lock:
         start_row = store.next_row_index()
-
-        try:
-            await arro_client.push_vectors(vectors, start_row)
-        except ArroServerError as exc:
-            logger.error("[ingest] arro-server push failed at start_row=%d: %s", start_row, exc)
-            raise HTTPException(
-                status_code=502,
-                detail=f"arro-server error: {exc}",
-            ) from exc
 
         documents = [
             Document(
@@ -127,7 +121,43 @@ async def ingest(
             )
             for i, item in enumerate(request.documents)
         ]
-        store.upsert_batch(start_row, documents)
+        statuses = store.upsert_batch(start_row, documents, vectors)
+
+        # Step 5 — Sync to arro-server via Zarr rewrite
+        try:
+            # 5a. Read ALL current vectors from store
+            all_vectors = store.get_all_vectors()
+
+            # 5b. Check if the dataset already exists on arro-server
+            meta = await arro_client.dataset_metadata()
+            is_new = meta is None
+
+            # 5c. Initialise an upload slot
+            upload_path = settings.arro_server_upload_path or await arro_client.upload_init()
+
+            # 5d. Write the full embedding matrix as a Zarr v3 array
+            zarr.open_array(
+                upload_path,
+                mode="w",
+                shape=all_vectors.shape,
+                dtype="float64",
+                zarr_version=3,
+            )
+            zarr.open_array(upload_path, mode="r+")[:] = all_vectors
+
+            # 5e. Commit the upload
+            commit_result = await arro_client.upload_commit(upload_path)
+
+            # 5f. Rebuild index if stale or new dataset
+            if commit_result.index_stale or is_new:
+                await arro_client.build_index()
+
+        except ArroServerError as exc:
+            logger.error("[ingest] arro-server sync failed at start_row=%d: %s", start_row, exc)
+            raise HTTPException(
+                status_code=502,
+                detail=f"arro-server error: {exc}",
+            ) from exc
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     logger.info(

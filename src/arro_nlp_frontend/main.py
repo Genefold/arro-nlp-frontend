@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -24,13 +25,23 @@ logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Manage application startup and shutdown.
+
+    On startup: initialises Embedder, DocumentStore, ArroClient, and the
+    asyncio.Lock used to serialise ingest operations. Logs embedder config
+    and performs a consistency check between the arro-server dataset shape
+    and the local document store row count.
+
+    On shutdown: closes the ArroClient httpx session and the SQLite connection.
+    """
     app.state.embedder = Embedder.from_settings()
     app.state.store = DocumentStore(Path(settings.store_db_path))
     app.state.ingest_lock = asyncio.Lock()
     app.state.arro_client = ArroClient(
         base_url=settings.arro_server_url,
         dataset_id=settings.arro_server_dataset_id,
+        root_label=settings.arro_server_root_label,
     )
 
     logger.info(
@@ -43,7 +54,8 @@ async def lifespan(app: FastAPI):
     logger.info("Embedder ready. dim=%d", app.state.embedder.dim)
 
     try:
-        arro_rows = await app.state.arro_client.row_count()
+        meta = await app.state.arro_client.dataset_metadata()
+        arro_rows = meta["shape"][0] if meta is not None else 0
         store_rows = app.state.store.count()
         if arro_rows != store_rows:
             logger.warning(
@@ -53,7 +65,7 @@ async def lifespan(app: FastAPI):
                 store_rows,
             )
     except ArroServerError:
-        logger.warning("[startup] Could not reach arro-server for row count check.")
+        logger.warning("[startup] Could not reach arro-server for metadata check.")
 
     yield
 

@@ -6,16 +6,19 @@ Tests
 2.  Batch yields contiguous row indices
 3.  Status reflects "created" vs. "updated"
 4.  Documents are persisted in the store
-5.  Vectors are pushed to arro-server
-6.  Duplicate doc_ids in request yield 422
-7.  Empty batch yields 422
-8.  arro-server failure yields 502, no store write
-9.  arro-server failure leaves store unchanged
-10. Second batch starts at correct row_index
-11. start_row uses MAX(row_index)+1, not COUNT (soft-delete safety)
-12. Concurrent batches do not overlap row indices
-13. duration_ms is present and non-negative
-14. Metadata round-trips correctly
+5.  Vectors are stored in SQLite (get_all_vectors)
+6.  arro-server sync methods are called (upload_init, upload_commit, etc.)
+7.  Duplicate doc_ids in request yield 422
+8.  Empty batch yields 422
+9.  arro-server failure yields 502 (store is written first)
+10. arro-server failure leaves all local docs intact
+11. Second batch starts at correct row_index
+12. start_row uses MAX(row_index)+1, not COUNT (soft-delete safety)
+13. Concurrent batches do not overlap row indices
+14. duration_ms is present and non-negative
+15. Metadata round-trips correctly
+16. build_index called when index_stale=True
+17. build_index called for new dataset (metadata returns None)
 """
 
 from __future__ import annotations
@@ -23,12 +26,12 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
-import pytest
+import numpy as np
 
-from arro_nlp_frontend.arro_client import ArroClient, ArroServerError
+from arro_nlp_frontend.arro_client import ArroClient, ArroServerError, UploadCommitResult
 from arro_nlp_frontend.embedder import Embedder
 from arro_nlp_frontend.main import create_app
 from arro_nlp_frontend.store import DocumentStore
@@ -47,6 +50,7 @@ def _post(client, docs):
 # Happy path
 # ---------------------------------------------------------------------------
 
+
 def test_ingest_single_doc_returns_200(ingest_client):
     client, _, _ = ingest_client
     r = _post(client, [{"doc_id": "doc0", "text": "hello"}])
@@ -59,11 +63,14 @@ def test_ingest_single_doc_returns_200(ingest_client):
 
 def test_ingest_batch_row_indices_contiguous(ingest_client):
     client, _, _ = ingest_client
-    r = _post(client, [
-        {"doc_id": "doc0", "text": "text0"},
-        {"doc_id": "doc1", "text": "text1"},
-        {"doc_id": "doc2", "text": "text2"},
-    ])
+    r = _post(
+        client,
+        [
+            {"doc_id": "doc0", "text": "text0"},
+            {"doc_id": "doc1", "text": "text1"},
+            {"doc_id": "doc2", "text": "text2"},
+        ],
+    )
     assert r.status_code == 200
     indices = [res["row_index"] for res in r.json()["results"]]
     assert indices == [0, 1, 2]
@@ -85,16 +92,26 @@ def test_ingest_persists_in_store(ingest_client):
     assert doc.text == "hello"
 
 
-def test_ingest_vectors_pushed_to_arro(ingest_client):
-    """push_vectors is called exactly once with start_row=0 for first ingest."""
-    client, _, mock_arro = ingest_client
+def test_ingest_vectors_stored_in_sqlite(ingest_client):
+    """Vectors are persisted in SQLite and readable via get_all_vectors."""
+    client, store, _ = ingest_client
     _post(client, [{"doc_id": "doc0", "text": "hello"}])
-    mock_arro.push_vectors.assert_called_once()
-    _, kwargs = mock_arro.push_vectors.call_args
-    args = mock_arro.push_vectors.call_args.args
-    # start_row may be passed positionally or as keyword
-    start_row = kwargs.get("start_row", args[1] if len(args) > 1 else None)
-    assert start_row == 0
+    all_v = store.get_all_vectors()
+    assert all_v.shape[0] == 1
+    assert all_v.dtype == np.float64
+
+
+def test_ingest_arro_sync_called(ingest_client):
+    """All arro-server sync methods are called in correct order."""
+    client, _, mock_arro = ingest_client
+    mock_arro.dataset_metadata = AsyncMock(return_value={"shape": [0, 384]})
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", return_value=MagicMock()):
+        _post(client, [{"doc_id": "doc0", "text": "hello"}])
+
+    mock_arro.dataset_metadata.assert_called_once()
+    mock_arro.upload_init.assert_called_once()
+    mock_arro.upload_commit.assert_called_once()
+    mock_arro.build_index.assert_not_called()  # not new, index_stale=False
 
 
 def test_ingest_duration_ms_present(ingest_client):
@@ -121,17 +138,24 @@ def test_ingest_metadata_stored(ingest_client):
 # Row index correctness
 # ---------------------------------------------------------------------------
 
+
 def test_ingest_second_batch_start_row_correct(ingest_client):
     """Second batch of 2 docs starts at row_index=2, not 0."""
     client, _, _ = ingest_client
-    _post(client, [
-        {"doc_id": "doc0", "text": "text0"},
-        {"doc_id": "doc1", "text": "text1"},
-    ])
-    r = _post(client, [
-        {"doc_id": "doc2", "text": "text2"},
-        {"doc_id": "doc3", "text": "text3"},
-    ])
+    _post(
+        client,
+        [
+            {"doc_id": "doc0", "text": "text0"},
+            {"doc_id": "doc1", "text": "text1"},
+        ],
+    )
+    r = _post(
+        client,
+        [
+            {"doc_id": "doc2", "text": "text2"},
+            {"doc_id": "doc3", "text": "text3"},
+        ],
+    )
     assert r.status_code == 200
     results = r.json()["results"]
     assert results[0]["row_index"] == 2
@@ -141,11 +165,14 @@ def test_ingest_second_batch_start_row_correct(ingest_client):
 def test_ingest_start_row_uses_max_not_count(ingest_client):
     """After soft-deleting row 1, next ingest gets row_index=3, not row_index=2."""
     client, store, _ = ingest_client
-    _post(client, [
-        {"doc_id": "doc0", "text": "text0"},
-        {"doc_id": "doc1", "text": "text1"},
-        {"doc_id": "doc2", "text": "text2"},
-    ])
+    _post(
+        client,
+        [
+            {"doc_id": "doc0", "text": "text0"},
+            {"doc_id": "doc1", "text": "text1"},
+            {"doc_id": "doc2", "text": "text2"},
+        ],
+    )
     store.delete_by_id("doc1")  # ghost row at index 1
     r = _post(client, [{"doc_id": "doc3", "text": "text3"}])
     assert r.status_code == 200
@@ -162,19 +189,25 @@ def test_ingest_concurrent_batches_no_row_overlap(tmp_path: Path) -> None:
         app = create_app()
         app.state.embedder = Embedder(backend="local", model="all-MiniLM-L6-v2", scale_factor=1.0)
         app.state.store = DocumentStore(tmp_path / "concurrent_test.sqlite")
-        app.state.arro_client = AsyncMock(spec=ArroClient)
-        app.state.arro_client.push_vectors = AsyncMock(return_value=None)
-        app.state.arro_client.row_count = AsyncMock(return_value=0)
+        mock_arro = AsyncMock(spec=ArroClient)
+        mock_arro.dataset_metadata = AsyncMock(return_value=None)
+        mock_arro.upload_init = AsyncMock(return_value="/tmp/test_upload.zarr")
+        mock_arro.upload_commit = AsyncMock(
+            return_value=UploadCommitResult(index_stale=False, shape=[1, 384])
+        )
+        mock_arro.build_index = AsyncMock(return_value=None)
+        app.state.arro_client = mock_arro
         app.state.ingest_lock = asyncio.Lock()
 
     transport = httpx.ASGITransport(app=app)
 
     async def _post_ingest(doc_id: str) -> list[int]:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-            r = await c.post(
-                "/ingest",
-                json={"documents": [{"doc_id": doc_id, "text": "text"}]},
-            )
+            with patch("arro_nlp_frontend.ingest.zarr.open_array", return_value=MagicMock()):
+                r = await c.post(
+                    "/ingest",
+                    json={"documents": [{"doc_id": doc_id, "text": "text"}]},
+                )
             assert r.status_code == 200, f"Unexpected {r.status_code}: {r.text}"
             return [x["row_index"] for x in r.json()["results"]]
 
@@ -195,12 +228,16 @@ def test_ingest_concurrent_batches_no_row_overlap(tmp_path: Path) -> None:
 # Error handling
 # ---------------------------------------------------------------------------
 
+
 def test_ingest_duplicate_doc_ids_in_request_422(ingest_client):
     client, _, _ = ingest_client
-    r = _post(client, [
-        {"doc_id": "dup", "text": "hello"},
-        {"doc_id": "dup", "text": "world"},
-    ])
+    r = _post(
+        client,
+        [
+            {"doc_id": "dup", "text": "hello"},
+            {"doc_id": "dup", "text": "world"},
+        ],
+    )
     assert r.status_code == 422
 
 
@@ -210,24 +247,55 @@ def test_ingest_empty_list_422(ingest_client):
     assert r.status_code == 422
 
 
-def test_ingest_arro_server_502_no_store_write(ingest_client):
-    """If arro-server fails, the store must not be written at all."""
+def test_ingest_arro_server_502_returns_error(ingest_client):
+    """If arro-server sync fails, a 502 is returned (store is written first)."""
     client, store, mock_arro = ingest_client
-    mock_arro.push_vectors.side_effect = ArroServerError("mocked failure")
-    r = _post(client, [{"doc_id": "doc0", "text": "hello"}])
+    mock_arro.dataset_metadata.side_effect = ArroServerError("mocked failure")
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", return_value=MagicMock()):
+        r = _post(client, [{"doc_id": "doc0", "text": "hello"}])
     assert r.status_code == 502
-    assert store.count() == 0
+    # Store IS written before sync attempt (new design contract)
+    assert store.count() == 1
+    assert store.get_by_id("doc0") is not None
 
 
-def test_ingest_arro_server_502_store_unchanged(ingest_client):
-    """A failed ingest after a successful one leaves previous docs intact."""
+def test_ingest_arro_server_502_leaves_previous_intact(ingest_client):
+    """A failed sync after a successful one leaves all local docs intact."""
     client, store, mock_arro = ingest_client
     # First ingest succeeds
-    _post(client, [{"doc_id": "doc0", "text": "hello"}])
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", return_value=MagicMock()):
+        _post(client, [{"doc_id": "doc0", "text": "hello"}])
     assert store.count() == 1
-    # Second ingest fails
-    mock_arro.push_vectors.side_effect = ArroServerError("mocked failure")
-    r = _post(client, [{"doc_id": "doc1", "text": "world"}])
+    # Second ingest fails during sync (store write succeeds first)
+    mock_arro.dataset_metadata.side_effect = ArroServerError("mocked failure")
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", return_value=MagicMock()):
+        r = _post(client, [{"doc_id": "doc1", "text": "world"}])
     assert r.status_code == 502
-    assert store.count() == 1          # doc0 untouched
-    assert store.get_by_id("doc1") is None  # doc1 never written
+    assert store.count() == 2  # both docs written locally
+    assert store.get_by_id("doc0") is not None
+    assert store.get_by_id("doc1") is not None
+
+
+# ---------------------------------------------------------------------------
+# Index rebuild scenarios
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_build_index_when_stale(ingest_client):
+    """build_index is called when upload_commit returns index_stale=True."""
+    client, _, mock_arro = ingest_client
+    mock_arro.upload_commit = AsyncMock(
+        return_value=UploadCommitResult(index_stale=True, shape=[1, 384])
+    )
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", return_value=MagicMock()):
+        _post(client, [{"doc_id": "doc0", "text": "hello"}])
+    mock_arro.build_index.assert_called_once()
+
+
+def test_ingest_build_index_when_new_dataset(ingest_client):
+    """build_index is called for new datasets (metadata returns None)."""
+    client, _, mock_arro = ingest_client
+    mock_arro.dataset_metadata = AsyncMock(return_value=None)
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", return_value=MagicMock()):
+        _post(client, [{"doc_id": "doc0", "text": "hello"}])
+    mock_arro.build_index.assert_called_once()
