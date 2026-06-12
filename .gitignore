@@ -13,3 +13,4 @@ data/models/
 .coverage
 .ruff_cache/
 roadmap.md
+data/
