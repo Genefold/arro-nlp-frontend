@@ -19,6 +19,7 @@ from arro_nlp_frontend.arro_client import ArroClient, ArroServerError
 from arro_nlp_frontend.config import settings
 from arro_nlp_frontend.embedder import Embedder
 from arro_nlp_frontend.ingest import router as ingest_router
+from arro_nlp_frontend.search import router as search_router
 from arro_nlp_frontend.store import DocumentStore
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,7 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(ingest_router)
+    app.include_router(search_router)
 
     @app.get("/health", tags=["ops"])
     async def health() -> dict:

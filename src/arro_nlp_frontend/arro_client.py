@@ -14,6 +14,9 @@ from dataclasses import dataclass
 from typing import cast
 
 import httpx
+import numpy as np
+
+__all__ = ["ArroServerError", "ArroClient", "UploadCommitResult", "SearchHit"]
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,14 @@ class UploadCommitResult:
 
     index_stale: bool
     shape: list[int]
+
+
+@dataclass
+class SearchHit:
+    """A single result returned by arro-server /search."""
+
+    index: int
+    score: float
 
 
 class ArroClient:
@@ -153,6 +164,39 @@ class ArroClient:
                 f"arro-server POST {url} returned {response.status_code}: {response.text}",
                 status_code=response.status_code,
             )
+
+    async def search(
+        self,
+        vector: np.ndarray,
+        top_k: int,
+        tau: float,
+    ) -> list[SearchHit]:
+        """POST /api/datasets/{dataset_id}/search
+
+        Body: {"vector": [float, ...], "k": top_k, "tau": tau, "mode": "tau"}
+        Returns list[SearchHit] ordered by score descending (arro-server contract).
+        Raises ArroServerError on any non-2xx or network failure.
+        """
+        payload = {
+            "vector": vector.tolist(),
+            "k": top_k,
+            "tau": tau,
+            "mode": "tau",
+        }
+        url = f"/api/datasets/{self._dataset_id}/search"
+        try:
+            response = await self._client.post(url, json=payload)
+        except httpx.RequestError as exc:
+            raise ArroServerError(str(exc), status_code=None) from exc
+
+        if response.status_code >= 400:
+            raise ArroServerError(
+                f"arro-server POST {url} returned {response.status_code}: {response.text}",
+                status_code=response.status_code,
+            )
+
+        raw: list[dict] = response.json()
+        return [SearchHit(index=int(hit["index"]), score=float(hit["score"])) for hit in raw]
 
     async def aclose(self) -> None:
         """Close the underlying httpx.AsyncClient."""

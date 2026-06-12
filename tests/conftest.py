@@ -92,6 +92,29 @@ def ingest_client(
             yield client, store, mock_arro_client
 
 
+@pytest.fixture
+def search_client(
+    store: DocumentStore,
+    mock_arro_client: AsyncMock,
+    local_embedder: Embedder,
+) -> Generator[tuple[TestClient, DocumentStore, AsyncMock], None, None]:
+    """TestClient wired for search tests.
+
+    Identical injection pattern to ingest_client. Returns (client, store, mock_arro).
+    mock_arro_client.search is pre-configured to return an empty list.
+    """
+    mock_arro_client.search = AsyncMock(return_value=[])
+
+    with patch("arro_nlp_frontend.main.lifespan", _noop_lifespan):
+        app = create_app()
+        app.state.embedder = local_embedder
+        app.state.store = store
+        app.state.arro_client = mock_arro_client
+        app.state.ingest_lock = asyncio.Lock()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            yield client, store, mock_arro_client
+
+
 @pytest.fixture(scope="session")
 def app_client(local_embedder: Embedder) -> Generator[TestClient, None, None]:
     """TestClient for smoke tests (/health, /openapi.json).
