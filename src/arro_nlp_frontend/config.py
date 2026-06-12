@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     arro_server_dataset_id: str = "cve/embeddings"
     arro_server_root_label: str = "main"
     arro_server_upload_path: str = ""
+    """Override the upload path returned by /api/upload/init.
+
+    Leave empty (default) to use the path arro-server provides.
+    Set this only when arro-server and arro-nlp-frontend share a
+    filesystem volume and the arro-server path is accessible locally
+    under a different mount point. upload_init is ALWAYS called
+    regardless — this only overrides the path used for the local
+    Zarr write and the subsequent upload_commit body.
+    """
     arro_server_search_tau: float = 0.42
 
     # ── Document store ─────────────────────────────────────────────────────────

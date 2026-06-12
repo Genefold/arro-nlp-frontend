@@ -46,6 +46,18 @@ def _post(client, docs):
     return client.post("/ingest", json={"documents": docs})
 
 
+def _zarr_mock() -> tuple[MagicMock, list[np.ndarray]]:
+    """Returns (mock_open, written_chunks).
+
+    written_chunks is populated via __setitem__ when arr[:] = vectors is called.
+    """
+    written: list[np.ndarray] = []
+    mock_arr = MagicMock()
+    mock_arr.__setitem__ = lambda self, key, value: written.append(value)  # type: ignore[method-assign]
+    mock_open = MagicMock(return_value=mock_arr)
+    return mock_open, written
+
+
 # ---------------------------------------------------------------------------
 # Happy path
 # ---------------------------------------------------------------------------
@@ -105,13 +117,18 @@ def test_ingest_arro_sync_called(ingest_client):
     """All arro-server sync methods are called in correct order."""
     client, _, mock_arro = ingest_client
     mock_arro.dataset_metadata = AsyncMock(return_value={"shape": [0, 384]})
-    with patch("arro_nlp_frontend.ingest.zarr.open_array", return_value=MagicMock()):
+    mock_open, written = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         _post(client, [{"doc_id": "doc0", "text": "hello"}])
 
     mock_arro.dataset_metadata.assert_called_once()
     mock_arro.upload_init.assert_called_once()
     mock_arro.upload_commit.assert_called_once()
     mock_arro.build_index.assert_not_called()  # not new, index_stale=False
+    # Zarr was actually written with real vectors
+    assert len(written) == 1
+    assert written[0].shape[0] == 1
+    assert written[0].dtype == np.float64
 
 
 def test_ingest_duration_ms_present(ingest_client):
@@ -201,9 +218,11 @@ def test_ingest_concurrent_batches_no_row_overlap(tmp_path: Path) -> None:
 
     transport = httpx.ASGITransport(app=app)
 
+    mock_open_zarr, _ = _zarr_mock()
+
     async def _post_ingest(doc_id: str) -> list[int]:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-            with patch("arro_nlp_frontend.ingest.zarr.open_array", return_value=MagicMock()):
+            with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open_zarr):
                 r = await c.post(
                     "/ingest",
                     json={"documents": [{"doc_id": doc_id, "text": "text"}]},
@@ -251,7 +270,8 @@ def test_ingest_arro_server_502_returns_error(ingest_client):
     """If arro-server sync fails, a 502 is returned (store is written first)."""
     client, store, mock_arro = ingest_client
     mock_arro.dataset_metadata.side_effect = ArroServerError("mocked failure")
-    with patch("arro_nlp_frontend.ingest.zarr.open_array", return_value=MagicMock()):
+    mock_open, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         r = _post(client, [{"doc_id": "doc0", "text": "hello"}])
     assert r.status_code == 502
     # Store IS written before sync attempt (new design contract)
@@ -263,12 +283,14 @@ def test_ingest_arro_server_502_leaves_previous_intact(ingest_client):
     """A failed sync after a successful one leaves all local docs intact."""
     client, store, mock_arro = ingest_client
     # First ingest succeeds
-    with patch("arro_nlp_frontend.ingest.zarr.open_array", return_value=MagicMock()):
+    mock_open, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         _post(client, [{"doc_id": "doc0", "text": "hello"}])
     assert store.count() == 1
     # Second ingest fails during sync (store write succeeds first)
     mock_arro.dataset_metadata.side_effect = ArroServerError("mocked failure")
-    with patch("arro_nlp_frontend.ingest.zarr.open_array", return_value=MagicMock()):
+    mock_open2, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open2):
         r = _post(client, [{"doc_id": "doc1", "text": "world"}])
     assert r.status_code == 502
     assert store.count() == 2  # both docs written locally
@@ -287,7 +309,8 @@ def test_ingest_build_index_when_stale(ingest_client):
     mock_arro.upload_commit = AsyncMock(
         return_value=UploadCommitResult(index_stale=True, shape=[1, 384])
     )
-    with patch("arro_nlp_frontend.ingest.zarr.open_array", return_value=MagicMock()):
+    mock_open, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         _post(client, [{"doc_id": "doc0", "text": "hello"}])
     mock_arro.build_index.assert_called_once()
 
@@ -296,6 +319,24 @@ def test_ingest_build_index_when_new_dataset(ingest_client):
     """build_index is called for new datasets (metadata returns None)."""
     client, _, mock_arro = ingest_client
     mock_arro.dataset_metadata = AsyncMock(return_value=None)
-    with patch("arro_nlp_frontend.ingest.zarr.open_array", return_value=MagicMock()):
+    mock_open, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         _post(client, [{"doc_id": "doc0", "text": "hello"}])
     mock_arro.build_index.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Zarr array content verification
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_zarr_array_written_with_correct_vectors(ingest_client):
+    """Vectors actually written to Zarr array — not empty."""
+    client, store, _ = ingest_client
+    mock_open, written = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        _post(client, [{"doc_id": "doc0", "text": "hello"}])
+    assert len(written) == 1
+    assert isinstance(written[0], np.ndarray)
+    assert written[0].shape[0] == 1  # one doc
+    assert written[0].dtype == np.float64

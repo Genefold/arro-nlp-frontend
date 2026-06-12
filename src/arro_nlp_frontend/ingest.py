@@ -132,18 +132,22 @@ async def ingest(
             meta = await arro_client.dataset_metadata()
             is_new = meta is None
 
-            # 5c. Initialise an upload slot
-            upload_path = settings.arro_server_upload_path or await arro_client.upload_init()
+            # 5c. Initialise an upload slot on arro-server.
+            # upload_init validates dataset_id + root and registers the slot.
+            # If arro_server_upload_path is set, we override the returned path
+            # (shared-volume deployments) but still call upload_init to register.
+            server_upload_path = await arro_client.upload_init()
+            upload_path = settings.arro_server_upload_path or server_upload_path
 
             # 5d. Write the full embedding matrix as a Zarr v3 array
-            zarr.open_array(
+            arr = zarr.open_array(
                 upload_path,
                 mode="w",
                 shape=all_vectors.shape,
                 dtype="float64",
                 zarr_version=3,
             )
-            zarr.open_array(upload_path, mode="r+")[:] = all_vectors
+            arr[:] = all_vectors
 
             # 5e. Commit the upload
             commit_result = await arro_client.upload_commit(upload_path)
