@@ -69,6 +69,7 @@ def mock_arro_client() -> AsyncMock:
         return_value=UploadCommitResult(index_stale=False, shape=[0, 384])
     )
     client.build_index = AsyncMock(return_value=None)
+    client.search = AsyncMock(return_value=[])
     return client
 
 
@@ -101,10 +102,8 @@ def search_client(
     """TestClient wired for search tests.
 
     Identical injection pattern to ingest_client. Returns (client, store, mock_arro).
-    mock_arro_client.search is pre-configured to return an empty list.
+    search is pre-configured in mock_arro_client to return an empty list by default.
     """
-    mock_arro_client.search = AsyncMock(return_value=[])
-
     with patch("arro_nlp_frontend.main.lifespan", _noop_lifespan):
         app = create_app()
         app.state.embedder = local_embedder

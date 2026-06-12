@@ -6,13 +6,14 @@ Test inventory:
   1.  test_search_returns_hydrated_results
   2.  test_search_rank_is_sequential_from_one
   3.  test_search_skips_missing_row_silently
-  4.  test_search_empty_query_400
-  5.  test_search_whitespace_only_query_400
-  6.  test_search_arro_server_down_502
-  7.  test_search_tau_override_forwarded
-  8.  test_search_default_tau_from_settings
-  9.  test_search_empty_results_from_arro
-  10. test_search_query_time_ms_present
+  4.  test_search_rank_resequenced_after_ghost_skips
+  5.  test_search_empty_query_400
+  6.  test_search_whitespace_only_query_400
+  7.  test_search_arro_server_down_502
+  8.  test_search_tau_override_forwarded
+  9.  test_search_default_tau_from_settings
+  10. test_search_empty_results_from_arro
+  11. test_search_query_time_ms_present
 """
 
 from __future__ import annotations
@@ -39,19 +40,22 @@ def _post(client, query: str, top_k: int = 10, tau: float | None = None):
 
 
 def _seed_store(store, docs: list[tuple[int, str, str]]) -> None:
-    """Insert (row_index, doc_id, text) tuples directly into the store."""
-    document_list = [
-        Document(
+    """Insert documents at their exact row_index.
+
+    Each (row_index, doc_id, text) tuple is inserted independently so
+    upsert_batch(start_row=row, ...) places the doc at exactly that row.
+    Calling upsert_batch once with start_row=docs[0][0] would assign rows
+    sequentially from that offset, which is wrong for non-contiguous indices.
+    """
+    for row, doc_id, text in docs:
+        doc = Document(
             row_index=row,
             doc_id=doc_id,
             text=text,
             metadata={},
             ingested_at=datetime.now(UTC),
         )
-        for row, doc_id, text in docs
-    ]
-    vecs = np.zeros((len(docs), 384), dtype=np.float64)
-    store.upsert_batch(docs[0][0], document_list, vecs)
+        store.upsert_batch(row, [doc], np.zeros((1, 384), dtype=np.float64))
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +123,28 @@ def test_search_skips_missing_row_silently(search_client):
     results = r.json()["results"]
     assert len(results) == 1
     assert results[0]["row_index"] == 0
+    assert results[0]["rank"] == 1
+
+
+def test_search_rank_resequenced_after_ghost_skips(search_client):
+    """Ranks are 1..N after ghost skips -- no gaps in the rank sequence."""
+    client, store, mock_arro = search_client
+    _seed_store(store, [(0, "doc0", "first"), (2, "doc2", "third")])
+    mock_arro.search = AsyncMock(
+        return_value=[
+            SearchHit(index=0, score=0.9),   # found
+            SearchHit(index=1, score=0.7),   # ghost -- row 1 not in store
+            SearchHit(index=2, score=0.5),   # found
+        ],
+    )
+
+    r = _post(client, "query")
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 2
+    assert results[0]["rank"] == 1
+    assert results[1]["rank"] == 2
+    assert results[1]["row_index"] == 2
 
 
 def test_search_empty_results_from_arro(search_client):

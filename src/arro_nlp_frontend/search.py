@@ -117,7 +117,7 @@ async def search(
 
     # Step 5 -- hydrate from store
     results: list[SearchResult] = []
-    for rank, hit in enumerate(hits, start=1):
+    for hit in hits:
         doc = store.get_by_row(hit.index)
         if doc is None:
             logger.warning(
@@ -128,7 +128,7 @@ async def search(
             continue
         results.append(
             SearchResult(
-                rank=rank,
+                rank=len(results) + 1,
                 score=hit.score,
                 row_index=hit.index,
                 doc_id=doc.doc_id,
