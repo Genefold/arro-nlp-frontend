@@ -43,10 +43,12 @@ class TestEmbedderLocal:
         """encode_batch must NOT call normalize_embeddings=True.
         Two semantically different texts produce vectors with different norms;
         normalised vectors would all have norm exactly 1.0."""
-        vecs = local_embedder.encode_batch([
-            "remote code execution via buffer overflow",
-            "x",
-        ])
+        vecs = local_embedder.encode_batch(
+            [
+                "remote code execution via buffer overflow",
+                "x",
+            ]
+        )
         norm_a = float(np.linalg.norm(vecs[0]))
         norm_b = float(np.linalg.norm(vecs[1]))
         assert norm_a != norm_b or abs(norm_a - 1.0) > 1e-6, (
