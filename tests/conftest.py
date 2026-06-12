@@ -69,6 +69,7 @@ def mock_arro_client() -> AsyncMock:
         return_value=UploadCommitResult(index_stale=False, shape=[0, 384])
     )
     client.build_index = AsyncMock(return_value=None)
+    client.search = AsyncMock(return_value=[])
     return client
 
 
@@ -81,6 +82,27 @@ def ingest_client(
     """TestClient with lifespan patched out, store and arro_client injected.
 
     Returns a 3-tuple: (client, store, mock_arro_client).
+    """
+    with patch("arro_nlp_frontend.main.lifespan", _noop_lifespan):
+        app = create_app()
+        app.state.embedder = local_embedder
+        app.state.store = store
+        app.state.arro_client = mock_arro_client
+        app.state.ingest_lock = asyncio.Lock()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            yield client, store, mock_arro_client
+
+
+@pytest.fixture
+def search_client(
+    store: DocumentStore,
+    mock_arro_client: AsyncMock,
+    local_embedder: Embedder,
+) -> Generator[tuple[TestClient, DocumentStore, AsyncMock], None, None]:
+    """TestClient wired for search tests.
+
+    Identical injection pattern to ingest_client. Returns (client, store, mock_arro).
+    search is pre-configured in mock_arro_client to return an empty list by default.
     """
     with patch("arro_nlp_frontend.main.lifespan", _noop_lifespan):
         app = create_app()
