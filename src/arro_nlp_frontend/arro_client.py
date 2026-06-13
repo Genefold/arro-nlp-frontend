@@ -51,32 +51,26 @@ class ArroClient:
     Parameters
     ----------
     base_url:   e.g. "http://localhost:8001"
-    dataset_id: e.g. "main--cve_embeddings"
-    root_label: e.g. "main" — must match an ARRO_SERVER_DATA_ROOTS key
     timeout:    httpx timeout in seconds (default 30.0)
     """
 
     def __init__(
         self,
         base_url: str,
-        dataset_id: str,
-        root_label: str,
         timeout: float = 30.0,
     ) -> None:
         self._client = httpx.AsyncClient(
             base_url=base_url,
             timeout=httpx.Timeout(timeout),
         )
-        self._dataset_id = dataset_id
-        self._root_label = root_label
 
-    async def dataset_metadata(self) -> dict | None:
+    async def dataset_metadata(self, dataset_id: str) -> dict | None:
         """GET /api/datasets/{dataset_id}/metadata
 
         Returns the metadata dict on 200, None on 404 (dataset not yet created).
         Raises ArroServerError on other non-2xx.
         """
-        url = f"/api/datasets/{self._dataset_id}/metadata"
+        url = f"/api/datasets/{dataset_id}/metadata"
         try:
             response = await self._client.get(url)
         except httpx.RequestError as exc:
@@ -91,17 +85,17 @@ class ArroClient:
             )
         return cast(dict, response.json())
 
-    async def upload_init(self) -> str:
+    async def upload_init(self, dataset_id: str, root_label: str) -> str:
         """POST /api/upload/init
 
-        Body: {"dataset_id": self._dataset_id, "root": self._root_label}
-        Returns upload_path (str) — the absolute filesystem path where
+        Body: {"dataset_id": dataset_id, "root": root_label}
+        Returns upload_path (str) -- the absolute filesystem path where
         the caller must write the Zarr v3 array.
         Raises ArroServerError on failure.
         """
         payload = {
-            "dataset_id": self._dataset_id,
-            "root": self._root_label,
+            "dataset_id": dataset_id,
+            "root": root_label,
         }
         url = "/api/upload/init"
         try:
@@ -116,15 +110,15 @@ class ArroClient:
             )
         return str(response.json()["upload_path"])
 
-    async def upload_commit(self, fs_path: str) -> UploadCommitResult:
+    async def upload_commit(self, dataset_id: str, fs_path: str) -> UploadCommitResult:
         """POST /api/upload/commit
 
-        Body: {"dataset_id": self._dataset_id, "fs_path": fs_path}
+        Body: {"dataset_id": dataset_id, "fs_path": fs_path}
         Returns UploadCommitResult(index_stale, shape).
         Raises ArroServerError on failure.
         """
         payload = {
-            "dataset_id": self._dataset_id,
+            "dataset_id": dataset_id,
             "fs_path": fs_path,
         }
         url = "/api/upload/commit"
@@ -144,7 +138,7 @@ class ArroClient:
             shape=list(data["shape"]),
         )
 
-    async def build_index(self, graph_params: dict | None = None) -> None:
+    async def build_index(self, dataset_id: str, graph_params: dict | None = None) -> None:
         """POST /api/datasets/{dataset_id}/index
 
         Body: {"graph_params": graph_params} or {} for server defaults.
@@ -153,7 +147,7 @@ class ArroClient:
         payload: dict = {}
         if graph_params is not None:
             payload["graph_params"] = graph_params
-        url = f"/api/datasets/{self._dataset_id}/index"
+        url = f"/api/datasets/{dataset_id}/index"
         try:
             response = await self._client.post(url, json=payload)
         except httpx.RequestError as exc:
@@ -167,6 +161,7 @@ class ArroClient:
 
     async def search(
         self,
+        dataset_id: str,
         vector: np.ndarray,
         top_k: int,
         tau: float,
@@ -183,7 +178,7 @@ class ArroClient:
             "tau": tau,
             "mode": "tau",
         }
-        url = f"/api/datasets/{self._dataset_id}/search"
+        url = f"/api/datasets/{dataset_id}/search"
         try:
             response = await self._client.post(url, json=payload)
         except httpx.RequestError as exc:

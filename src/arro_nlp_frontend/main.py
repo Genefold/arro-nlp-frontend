@@ -12,10 +12,11 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 import uvicorn
 from fastapi import FastAPI
 
-from arro_nlp_frontend.arro_client import ArroClient, ArroServerError
+from arro_nlp_frontend.arro_client import ArroClient
 from arro_nlp_frontend.config import settings
 from arro_nlp_frontend.embedder import Embedder
 from arro_nlp_frontend.ingest import router as ingest_router
@@ -39,11 +40,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.embedder = Embedder.from_settings()
     app.state.store = DocumentStore(Path(settings.store_db_path))
     app.state.ingest_lock = asyncio.Lock()
-    app.state.arro_client = ArroClient(
-        base_url=settings.arro_server_url,
-        dataset_id=settings.arro_server_dataset_id,
-        root_label=settings.arro_server_root_label,
-    )
+    app.state.arro_client = ArroClient(base_url=settings.arro_server_url)
 
     logger.info(
         "Loading embedder: backend=%s model=%s path=%r scale=%s",
@@ -55,18 +52,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Embedder ready. dim=%d", app.state.embedder.dim)
 
     try:
-        meta = await app.state.arro_client.dataset_metadata()
-        arro_rows = meta["shape"][0] if meta is not None else 0
-        store_rows = app.state.store.count()
-        if arro_rows != store_rows:
-            logger.warning(
-                "[startup] arro-server has %d rows, store has %d documents. "
-                "If arro-server was rebuilt, the store must be rebuilt too.",
-                arro_rows,
-                store_rows,
-            )
-    except ArroServerError:
-        logger.warning("[startup] Could not reach arro-server for metadata check.")
+        await app.state.arro_client._client.get("/health", timeout=3.0)
+        logger.info("[startup] arro-server is reachable.")
+    except httpx.RequestError:
+        logger.warning(
+            "[startup] Could not reach arro-server. Search will fail until it is available."
+        )
 
     yield
 

@@ -35,6 +35,22 @@ class IngestItem(BaseModel):
 
 
 class IngestRequest(BaseModel):
+    """Request body for POST /ingest."""
+
+    dataset_id: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "arro-server dataset identifier, e.g. 'cve/embeddings' or 'nvd/embeddings'. "
+            "All documents in this batch are associated with this dataset."
+        ),
+    )
+    root_label: str = Field(
+        default="",
+        description=(
+            "arro-server data root label. Defaults to settings.arro_server_root_label when empty."
+        ),
+    )
     documents: list[IngestItem] = Field(..., min_length=1)
 
 
@@ -64,13 +80,26 @@ async def ingest(
     production deployments, a database-level advisory lock or a serialised
     ingest queue is required.
 
+    LOCK IS GLOBAL ACROSS ALL DATASETS.
+    The lock is a single asyncio.Lock shared by all datasets. Two concurrent
+    ingest requests targeting different dataset_ids (e.g. 'ds/a' and 'ds/b')
+    will queue behind the same lock. This is safe and correct: each dataset
+    has an independent row_index counter and an independent Zarr array, so
+    there is no correctness reason for the shared lock -- it is a throughput
+    limitation. Under this design, ingest throughput for N datasets is the
+    same as for 1 dataset: fully serialised.
+
+    If per-dataset parallelism is required in future, replace the single
+    asyncio.Lock with a dict[str, asyncio.Lock] keyed by dataset_id. That
+    change requires its own spec and test coverage before implementation.
+
     Pipeline:
       1. Validate: non-empty list, no duplicate doc_ids within the batch
       2. Embed texts in chunks of EMBED_CHUNK -> float64 array (N, dim)
-      3. (inside lock) start_row = store.next_row_index()
+      3. (inside lock) start_row = store.next_row_index(dataset_id)
       4. (inside lock) upsert_batch into SQLite with vectors
       5. (inside lock) Sync to arro-server:
-         a. Read ALL vectors from SQLite (full matrix)
+         a. Read ALL vectors from SQLite for this dataset (full matrix)
          b. Check if dataset exists (dataset_metadata -> 404 = new)
          c. upload_init -> upload_path
          d. Write Zarr v3 array to upload_path
@@ -87,7 +116,9 @@ async def ingest(
     store = req.app.state.store
     arro_client = req.app.state.arro_client
 
-    # Step 1 — validate: no duplicate doc_ids within this batch
+    root_label = request.root_label or settings.arro_server_root_label
+
+    # Step 1 -- validate: no duplicate doc_ids within this batch
     doc_ids = [item.doc_id for item in request.documents]
     if len(doc_ids) != len(set(doc_ids)):
         seen: set[str] = set()
@@ -101,15 +132,15 @@ async def ingest(
             detail=f"Duplicate doc_ids in request: {duplicates}",
         )
 
-    # Step 2 — embed in chunks to avoid OOM on large requests
+    # Step 2 -- embed in chunks to avoid OOM on large requests
     texts = [item.text for item in request.documents]
     chunks = [texts[i : i + EMBED_CHUNK] for i in range(0, len(texts), EMBED_CHUNK)]
     parts = [embedder.encode_batch(chunk) for chunk in chunks]
     vectors = np.vstack(parts) if len(parts) > 1 else parts[0]
 
-    # Steps 3-5 — inside the lock: start_row is stable for the duration
+    # Steps 3-5 -- inside the lock: start_row is stable for the duration
     async with req.app.state.ingest_lock:
-        start_row = store.next_row_index()
+        start_row = store.next_row_index(dataset_id=request.dataset_id)
 
         documents = [
             Document(
@@ -121,22 +152,24 @@ async def ingest(
             )
             for i, item in enumerate(request.documents)
         ]
-        statuses = store.upsert_batch(start_row, documents, vectors)
+        statuses = store.upsert_batch(request.dataset_id, start_row, documents, vectors)
 
-        # Step 5 — Sync to arro-server via Zarr rewrite
+        # Step 5 -- Sync to arro-server via Zarr rewrite
         try:
             # 5a. Read ALL current vectors from store
-            all_vectors = store.get_all_vectors()
+            all_vectors = store.get_all_vectors(dataset_id=request.dataset_id)
 
             # 5b. Check if the dataset already exists on arro-server
-            meta = await arro_client.dataset_metadata()
+            meta = await arro_client.dataset_metadata(dataset_id=request.dataset_id)
             is_new = meta is None
 
             # 5c. Initialise an upload slot on arro-server.
             # upload_init validates dataset_id + root and registers the slot.
             # If arro_server_upload_path is set, we override the returned path
             # (shared-volume deployments) but still call upload_init to register.
-            server_upload_path = await arro_client.upload_init()
+            server_upload_path = await arro_client.upload_init(
+                dataset_id=request.dataset_id, root_label=root_label
+            )
             upload_path = settings.arro_server_upload_path or server_upload_path
 
             # 5d. Write the full embedding matrix as a Zarr v3 array
@@ -150,14 +183,21 @@ async def ingest(
             arr[:] = all_vectors
 
             # 5e. Commit the upload
-            commit_result = await arro_client.upload_commit(upload_path)
+            commit_result = await arro_client.upload_commit(
+                dataset_id=request.dataset_id, fs_path=upload_path
+            )
 
             # 5f. Rebuild index if stale or new dataset
             if commit_result.index_stale or is_new:
-                await arro_client.build_index()
+                await arro_client.build_index(dataset_id=request.dataset_id)
 
         except ArroServerError as exc:
-            logger.error("[ingest] arro-server sync failed at start_row=%d: %s", start_row, exc)
+            logger.error(
+                "[ingest] arro-server sync failed dataset=%s start_row=%d: %s",
+                request.dataset_id,
+                start_row,
+                exc,
+            )
             raise HTTPException(
                 status_code=502,
                 detail=f"arro-server error: {exc}",
@@ -165,8 +205,9 @@ async def ingest(
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     logger.info(
-        "[ingest] ingested %d docs start_row=%d elapsed=%dms",
+        "[ingest] ingested %d docs dataset=%s start_row=%d elapsed=%dms",
         len(documents),
+        request.dataset_id,
         start_row,
         elapsed_ms,
     )
