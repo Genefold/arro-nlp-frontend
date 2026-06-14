@@ -6,6 +6,7 @@ Pipeline: validate -> embed (chunked) -> lock -> next_row_index -> persist ->
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Literal
@@ -66,6 +67,19 @@ class IngestResponse(BaseModel):
     duration_ms: int
 
 
+def _get_dataset_lock(locks: dict[str, asyncio.Lock], dataset_id: str) -> asyncio.Lock:
+    """Return the asyncio.Lock for *dataset_id*, creating it lazily if absent.
+
+    Thread-safety note: this function must only be called from within the
+    asyncio event loop (single-threaded). Dict mutation here is safe because
+    asyncio is cooperative: no two coroutines can reach this point concurrently
+    for the same dataset_id without one of them already holding the lock.
+    """
+    if dataset_id not in locks:
+        locks[dataset_id] = asyncio.Lock()
+    return locks[dataset_id]
+
+
 @router.post("/ingest", response_model=IngestResponse, status_code=200)
 async def ingest(
     request: IngestRequest,
@@ -74,29 +88,23 @@ async def ingest(
     """Ingest documents: embed -> store in SQLite -> Zarr rewrite -> index.
 
     SINGLE-PROCESS GUARANTEE ONLY.
-    The asyncio.Lock prevents row index corruption under concurrent async
-    requests within a single uvicorn worker. It does NOT protect against
-    multiple uvicorn worker processes (--workers N > 1). For multi-worker
-    production deployments, a database-level advisory lock or a serialised
-    ingest queue is required.
+    The per-dataset asyncio.Lock prevents row index corruption under
+    concurrent async requests within a single uvicorn worker. It does NOT
+    protect against multiple uvicorn worker processes (--workers N > 1).
+    For multi-worker production deployments, a database-level advisory lock
+    or a serialised ingest queue is required.
 
-    LOCK IS GLOBAL ACROSS ALL DATASETS.
-    The lock is a single asyncio.Lock shared by all datasets. Two concurrent
-    ingest requests targeting different dataset_ids (e.g. 'ds/a' and 'ds/b')
-    will queue behind the same lock. This is safe and correct: each dataset
-    has an independent row_index counter and an independent Zarr array, so
-    there is no correctness reason for the shared lock -- it is a throughput
-    limitation. Under this design, ingest throughput for N datasets is the
-    same as for 1 dataset: fully serialised.
-
-    If per-dataset parallelism is required in future, replace the single
-    asyncio.Lock with a dict[str, asyncio.Lock] keyed by dataset_id. That
-    change requires its own spec and test coverage before implementation.
+    LOCK IS PER-DATASET.
+    A separate asyncio.Lock is created lazily for each dataset_id via
+    _get_dataset_lock(). Concurrent requests to different datasets run in
+    parallel. Concurrent requests to the same dataset are serialised to
+    protect the row_index counter and the Zarr rewrite.
 
     Pipeline:
       1. Validate: non-empty list, no duplicate doc_ids within the batch
       2. Embed texts in chunks of EMBED_CHUNK -> float64 array (N, dim)
-      3. (inside lock) start_row = store.next_row_index(dataset_id)
+      2a. (inside lock) -- per-dataset lock acquired via `_get_dataset_lock`
+      3. (inside lock) start_row = store.next_row_index()
       4. (inside lock) upsert_batch into SQLite with vectors
       5. (inside lock) Sync to arro-server:
          a. Read ALL vectors from SQLite for this dataset (full matrix)
@@ -139,7 +147,8 @@ async def ingest(
     vectors = np.vstack(parts) if len(parts) > 1 else parts[0]
 
     # Steps 3-5 -- inside the lock: start_row is stable for the duration
-    async with req.app.state.ingest_lock:
+    lock = _get_dataset_lock(req.app.state.ingest_locks, request.dataset_id)
+    async with lock:
         start_row = store.next_row_index(dataset_id=request.dataset_id)
 
         documents = [

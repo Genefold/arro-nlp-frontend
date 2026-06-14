@@ -11,8 +11,8 @@
 | [6](https://github.com/Genefold/arro-nlp-frontend/issues/6) | `POST /ingest` | ✅ Merged (PR #11) | #4, #5 | #7, cve-search#9 |
 | [7](https://github.com/Genefold/arro-nlp-frontend/issues/7) | `POST /search` | ✅ Merged (PR #16) | #4, #5, #6 | #8, webapp |
 | [8](https://github.com/Genefold/arro-nlp-frontend/issues/8) | `GET/DELETE /documents/{doc_id}` | ⏳ Pending | #5, #6 | leaf |
-| [17](https://github.com/Genefold/arro-nlp-frontend/issues/17) | Multi-dataset serving — DocumentStore v2 | 🔄 In review (PR #18) | #6, #7 | cve-search#9 |
-| [19](https://github.com/Genefold/arro-nlp-frontend/issues/19) | Per-dataset ingest lock (`dict[str, asyncio.Lock]`) | ⏳ Pending | PR #18 | — |
+| [17](https://github.com/Genefold/arro-nlp-frontend/issues/17) | Multi-dataset serving — DocumentStore v2 | ✅ Merged (PR #18) | #6, #7 | cve-search#9 |
+| [19](https://github.com/Genefold/arro-nlp-frontend/issues/19) | Per-dataset ingest lock (`dict[str, asyncio.Lock]`) | 🔄 In review (PR #20) | PR #18 | — |
 
 **On [`arro-cve-search`](https://github.com/Genefold/arro-cve-search)**
 
@@ -30,25 +30,22 @@
 - **DocumentStore v1** (`#5` / PR #10): SQLite-backed store, WAL, atomic upsert, soft delete, `MAX`-based row index.
 - **`POST /ingest`** (`#6` / PR #11): embed → SQLite → Zarr rewrite → arro-server push. Full offline test suite (19 tests).
 - **`POST /search`** (`#7` / PR #16): embed query → arro-server → hydrate from store. Ghost row handling. tau override. 11 tests.
+- **Multi-dataset serving** (PR #18, closes #17): DocumentStore v2, per-call `dataset_id`, `migrate.py`, 19 new tests.
 
 ### 🔄 In review
 
-- **Multi-dataset serving** (PR #18, closes #17):
-  - DocumentStore v2: `dataset_id` column, composite PK, per-dataset row counters.
-  - `ArroClient`: `dataset_id` removed from constructor, added as per-call arg to all 5 methods.
-  - `/ingest` and `/search`: `dataset_id` required in request body.
-  - `migrate.py`: one-shot v1 → v2 CLI migration with `.v1.bak` safety.
-  - 19 new tests across `test_store`, `test_ingest`, `test_search`, `test_migrate`.
-  - **Reviewed and verified clean.** CI will go green. Ready to merge.
+- **Per-dataset ingest lock** (PR #20, closes #19):
+  - Replaces single global `asyncio.Lock` with `dict[str, asyncio.Lock]` keyed by `dataset_id`.
+  - `_get_dataset_lock()` helper in `ingest.py` for lazy, auditable lock creation.
+  - 2 new concurrent tests (tests 22 & 23): cross-dataset parallelism + same-dataset serialisation.
 
 ### ⏳ Pending — this repo
 
-- **Issue #19** — per-dataset ingest lock: replace the global `asyncio.Lock` with `dict[str, asyncio.Lock]` keyed by `dataset_id`. Correctness is not affected today; this is a throughput improvement. Full spec in the issue. Implement after PR #18 merges.
 - **Issue #8** — `GET /documents/{doc_id}` and `DELETE /documents/{doc_id}`: read and soft-delete endpoints backed by the store. Low priority for the CVE search use case but required for a complete REST API.
 
 ### ⏳ Pending — `arro-cve-search`
 
-- **Issue #9** — `harness/ingest.py`: the CVE ingest harness is blocked on PR #18. Once #18 merges, ingest calls must include `dataset_id` in the request body (breaking change from v1). The harness needs to be written (or updated if a draft exists) to target the v2 API: `POST /ingest` with `{"dataset_id": "cve/embeddings", "documents": [...]}`. See **Gap analysis** section below.
+- **Issue #9** — `harness/ingest.py`: the CVE ingest harness. Ingest calls must include `dataset_id` in the request body: `POST /ingest` with `{"dataset_id": "cve/embeddings", "documents": [...]}`. See **Gap analysis** section below.
 
 ---
 
@@ -56,9 +53,9 @@
 
 This section lists every gap between the current state of `arro-nlp-frontend` and a working CVE semantic search product. Items are ordered by the sequence in which they must be resolved.
 
-### Gap 1 — PR #18 must be merged first (blocker)
+### Gap 1 — PR #20 should be merged (recommended)
 
-The CVE ingest harness (`arro-cve-search#9`) will call `POST /ingest` with a `dataset_id` field. That field does not exist on `main` today — it is only on `feat/multidataset-serving`. Merging PR #18 is the prerequisite for everything below.
+Not a hard blocker for CVE search correctness, but merging #20 before writing the ingest harness means the harness benefits from parallel dataset ingestion from day one.
 
 ### Gap 2 — `harness/ingest.py` does not exist (or is not updated for v2 API)
 
@@ -111,19 +108,18 @@ There is no `Dockerfile`, `docker-compose.yml`, or `k8s/` manifest for `arro-nlp
 
 ## Recommended next steps (ordered)
 
-1. **Merge PR #18.** It is reviewed and clean.
+1. **Merge PR #20** (per-dataset lock) — clean, reviewed, CI should go green.
 2. **Implement `arro-cve-search#9`** (CVE ingest harness) using the v2 `/ingest` API with `dataset_id: "cve/embeddings"`. Decide on data source (Gap 3) first.
-3. **Implement issue #19** (per-dataset lock) — small change, full spec already written, unblocks parallel dataset ingestion.
-4. **Implement issue #8** (`GET/DELETE /documents/{doc_id}`) — needed for CVE withdrawal handling.
-5. **Implement `arro-cve-search#10`** (query CLI or web UI) — makes the product usable.
-6. **Write `docker-compose.yml`** for `arro-server` + `arro-nlp-frontend` — prerequisite for integration testing and deployment.
-7. **Write `tests/integration/test_e2e.py`** — end-to-end smoke test with real arro-server.
+3. **Implement issue #8** (`GET/DELETE /documents/{doc_id}`) — needed for CVE withdrawal handling.
+4. **Implement `arro-cve-search#10`** (query CLI or web UI) — makes the product usable.
+5. **Write `docker-compose.yml`** for `arro-server` + `arro-nlp-frontend` — prerequisite for integration testing and deployment.
+6. **Write `tests/integration/test_e2e.py`** — end-to-end smoke test with real arro-server.
 
 ---
 
 # Codebase Analysis
 
-*As of PR #18 (open). Every section covers one architectural layer: design rationale, the specific risks introduced by that design, and the correct future path.*
+*As of PR #20 (open). Every section covers one architectural layer: design rationale, the specific risks introduced by that design, and the correct future path.*
 
 ---
 
@@ -215,15 +211,14 @@ Thin async HTTP wrapper using `httpx.AsyncClient`. As of PR #18: `dataset_id` is
 
 ### Design
 
-Two-phase pipeline: embed outside the lock (CPU-bound, no shared state), then acquire the dataset lock for `next_row_index → upsert_batch → Zarr rewrite`. SQLite is written first — 502 from arro-server leaves the document locally but the index stale; the next successful ingest self-heals.
+Two-phase pipeline: embed outside the lock (CPU-bound, no shared state), then acquire the per-dataset lock for `next_row_index → upsert_batch → Zarr rewrite`. SQLite is written first — 502 from arro-server leaves the document locally but the index stale; the next successful ingest self-heals.
 
-As of PR #18: `dataset_id` is required in the request body. The lock is a single global `asyncio.Lock` — correct for row-index safety, but it serialises ingest across all datasets (see issue #19 for the per-dataset lock upgrade).
+As of PR #20: `dataset_id` is required in the request body. The lock is a per-dataset `asyncio.Lock` from `app.state.ingest_locks`, created lazily via `_get_dataset_lock()`. Concurrent requests to different datasets now run in parallel.
 
 ### Risks
 
 - **Full Zarr rewrite on every ingest is O(N) in dataset size.** Every ingest — even a single document — reads all N vectors, writes a new Zarr array, and calls `upload_commit`. At 100K documents: ~300MB read + ~300MB write per call.
 - **Lock held for the full Zarr write.** The lock is held from `next_row_index()` through `build_index()`. For a large dataset this serialises all ingest requests for tens of seconds.
-- **Global lock across all datasets** (issue #19). Two concurrent requests to different `dataset_id`s queue behind the same lock even though they have no shared state. Fix: `dict[str, asyncio.Lock]` keyed by `dataset_id`.
 - **No batch size cap.** `IngestRequest.documents` has `min_length=1` but no `max_length`. OOM is possible on small deployments.
 
 ### Future work
@@ -263,7 +258,7 @@ Pure read path — no lock. As of PR #18: `dataset_id` is required in the reques
 |---|---|---|---|
 | Dataset size | ~50K docs before ingest becomes slow | O(N) Zarr rewrite per ingest | Append-only Zarr writes |
 | Ingest throughput (same dataset) | 1 concurrent (lock held for full Zarr write) | `asyncio.Lock` scope too wide | Release lock after SQLite write; move Zarr rewrite outside lock |
-| Ingest throughput (different datasets) | 1 concurrent (global lock) | Single `asyncio.Lock` for all datasets | Issue #19: `dict[str, asyncio.Lock]` |
+| Ingest throughput (different datasets) | N concurrent (per-dataset lock) | ✅ Fixed in PR #20 | — |
 | Search concurrency | Degrades under load | Sync embed blocks event loop | `run_in_executor` for embed |
 | Multi-worker (`--workers N`) | **Broken** — row index corruption | `asyncio.Lock` is process-local | SQLite `BEGIN EXCLUSIVE` or ingest queue |
 | Multi-replica (K8s) | **Broken** — same as multi-worker | Same root cause | Distributed advisory lock or message queue |
@@ -290,10 +285,9 @@ Pure read path — no lock. As of PR #18: `dataset_id` is required in the reques
 
 ### Phase 1 — Complete the core feature set (now)
 
-1. Merge PR #18 (multi-dataset serving — reviewed, clean).
+1. Merge PR #20 (per-dataset lock — reviewed, clean).
 2. Implement `arro-cve-search#9`: CVE ingest harness targeting v2 API (`dataset_id: "cve/embeddings"`).
-3. Implement issue #19: per-dataset lock (small change, full spec in issue).
-4. Implement issue #8: `GET/DELETE /documents/{doc_id}`.
+3. Implement issue #8: `GET/DELETE /documents/{doc_id}`.
 
 ### Phase 2 — Make it usable as a product
 
@@ -322,4 +316,4 @@ These fix silent data corruption, not features:
 1. Append-only Zarr writes: eliminate O(N) rewrite per ingest; requires arro-server API extension.
 2. Multi-worker safety: `BEGIN EXCLUSIVE` (same-host) or ARQ + Redis queue (multi-host).
 3. Search LRU cache: cache `(query_hash, top_k, tau)` → results with configurable TTL.
-4. Arrow IPC vector transport: replace JSON with Arrow IPC for ingest and search payloads.
+4. Arrow IPC vector transport: replace JSON with Arrow IPC for ingest and search payloads..

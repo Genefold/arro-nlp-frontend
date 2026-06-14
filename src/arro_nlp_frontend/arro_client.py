@@ -89,7 +89,7 @@ class ArroClient:
         """POST /api/upload/init
 
         Body: {"dataset_id": dataset_id, "root": root_label}
-        Returns upload_path (str) -- the absolute filesystem path where
+        Returns upload_path (str) — the absolute filesystem path where
         the caller must write the Zarr v3 array.
         Raises ArroServerError on failure.
         """
