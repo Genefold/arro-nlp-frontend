@@ -6,27 +6,120 @@
 
 | # | Title | Status | Depends on | Blocks |
 |---|---|---|---|---|
-| [4](https://github.com/Genefold/arro-nlp-frontend/issues/4) | `STORE_DB_PATH` in Settings | ✅ Merged | — | #5, #6, #7 |
-| [5](https://github.com/Genefold/arro-nlp-frontend/issues/5) | `store.py` — generic `DocumentStore` | ✅ Merged | #4 | #6, #7, #8 |
+| [4](https://github.com/Genefold/arro-nlp-frontend/issues/4) | `STORE_DB_PATH` in Settings | ✅ Merged (PR #9) | — | #5, #6, #7 |
+| [5](https://github.com/Genefold/arro-nlp-frontend/issues/5) | `store.py` — generic `DocumentStore` | ✅ Merged (PR #10) | #4 | #6, #7, #8 |
 | [6](https://github.com/Genefold/arro-nlp-frontend/issues/6) | `POST /ingest` | ✅ Merged (PR #11) | #4, #5 | #7, cve-search#9 |
-| [7](https://github.com/Genefold/arro-nlp-frontend/issues/7) | `POST /search` | 🔄 In review (PR #16) | #4, #5, #6 | #8, webapp |
+| [7](https://github.com/Genefold/arro-nlp-frontend/issues/7) | `POST /search` | ✅ Merged (PR #16) | #4, #5, #6 | #8, webapp |
 | [8](https://github.com/Genefold/arro-nlp-frontend/issues/8) | `GET/DELETE /documents/{doc_id}` | ⏳ Pending | #5, #6 | leaf |
+| [17](https://github.com/Genefold/arro-nlp-frontend/issues/17) | Multi-dataset serving — DocumentStore v2 | ✅ Merged (PR #18) | #6, #7 | cve-search#9 |
+| [19](https://github.com/Genefold/arro-nlp-frontend/issues/19) | Per-dataset ingest lock (`dict[str, asyncio.Lock]`) | 🔄 In review (PR #20) | PR #18 | — |
 
 **On [`arro-cve-search`](https://github.com/Genefold/arro-cve-search)**
 
 | # | Title | Status | Depends on |
 |---|---|---|---|
-| [9](https://github.com/Genefold/arro-cve-search/issues/9) | `harness/ingest.py` — CVE HTTP ingest | ⏳ Pending | arro-nlp-frontend#6 |
+| [9](https://github.com/Genefold/arro-cve-search/issues/9) | `harness/ingest.py` — CVE HTTP ingest | ⏳ Pending | arro-nlp-frontend PR #18 merged |
 
-## Recommended implementation order
+---
 
-#4 → #5 → #6 → #7 → #8, then cve-search #9 last.
+## Where we are right now
+
+### ✅ Complete and merged
+
+- **Config** (`#4` / PR #9): `STORE_DB_PATH`, `ARRO_SERVER_*` settings, `.env.example`.
+- **DocumentStore v1** (`#5` / PR #10): SQLite-backed store, WAL, atomic upsert, soft delete, `MAX`-based row index.
+- **`POST /ingest`** (`#6` / PR #11): embed → SQLite → Zarr rewrite → arro-server push. Full offline test suite (19 tests).
+- **`POST /search`** (`#7` / PR #16): embed query → arro-server → hydrate from store. Ghost row handling. tau override. 11 tests.
+- **Multi-dataset serving** (PR #18, closes #17): DocumentStore v2, per-call `dataset_id`, `migrate.py`, 19 new tests.
+
+### 🔄 In review
+
+- **Per-dataset ingest lock** (PR #20, closes #19):
+  - Replaces single global `asyncio.Lock` with `dict[str, asyncio.Lock]` keyed by `dataset_id`.
+  - `_get_dataset_lock()` helper in `ingest.py` for lazy, auditable lock creation.
+  - 2 new concurrent tests (tests 22 & 23): cross-dataset parallelism + same-dataset serialisation.
+
+### ⏳ Pending — this repo
+
+- **Issue #8** — `GET /documents/{doc_id}` and `DELETE /documents/{doc_id}`: read and soft-delete endpoints backed by the store. Low priority for the CVE search use case but required for a complete REST API.
+
+### ⏳ Pending — `arro-cve-search`
+
+- **Issue #9** — `harness/ingest.py`: the CVE ingest harness. Ingest calls must include `dataset_id` in the request body: `POST /ingest` with `{"dataset_id": "cve/embeddings", "documents": [...]}`. See **Gap analysis** section below.
+
+---
+
+## What is missing for arro-cve-search to work end-to-end
+
+This section lists every gap between the current state of `arro-nlp-frontend` and a working CVE semantic search product. Items are ordered by the sequence in which they must be resolved.
+
+### Gap 1 — PR #20 should be merged (recommended)
+
+Not a hard blocker for CVE search correctness, but merging #20 before writing the ingest harness means the harness benefits from parallel dataset ingestion from day one.
+
+### Gap 2 — `harness/ingest.py` does not exist (or is not updated for v2 API)
+
+The ingest harness needs to:
+- Parse NVD/CVE JSON feed (or CVE List v5 format).
+- Extract `cve_id`, `description`, and structured `metadata` (CVSS score, CWE, affected products, published date) per CVE.
+- `POST /ingest` to `arro-nlp-frontend` in batches of ≤ 500 docs with `dataset_id: "cve/embeddings"`.
+- Handle `502` responses from the frontend (arro-server sync failure) with retry.
+- Track ingested CVE IDs to support incremental re-runs (only ingest new/updated CVEs).
+- Report progress: total ingested, created vs updated, elapsed time.
+
+This is `arro-cve-search#9`. It has no implementation yet.
+
+### Gap 3 — No CVE data source is configured
+
+The harness needs a CVE data source. Options:
+- **NVD REST API v2** (`https://services.nvd.nist.gov/rest/json/cves/2.0`): paginated, rate-limited (50 req/30s without API key, 2000 req/30s with key). Requires an NVD API key env var.
+- **CVE List v5 GitHub mirror** (`https://github.com/CVEProject/cvelistV5`): full dataset as JSON files, no rate limit, requires cloning ~2GB repo or using the GitHub API.
+- **OSV.dev API** (`https://api.osv.dev`): broader ecosystem, not CVE-specific.
+
+No data source has been chosen or documented. This must be decided before the harness is written.
+
+### Gap 4 — No search client / webapp
+
+`POST /search` is implemented and tested. Nothing consumes it yet. The CVE search product needs at minimum:
+- A CLI query tool (`arro-cve-search/query.py`): `python query.py "heap overflow in network driver"` → ranked CVE list with scores.
+- Or a minimal web UI.
+
+This is untracked. Should become `arro-cve-search#10` (or equivalent).
+
+### Gap 5 — `GET/DELETE /documents/{doc_id}` is unimplemented (issue #8)
+
+For a CVE search product this matters when:
+- A CVE is rejected/withdrawn from the NVD feed and must be removed from search results.
+- A CVE description is updated and the embedding must be refreshed.
+
+Without `DELETE`, the only option is re-ingest (which updates the embedding but leaves a ghost vector in arro-server — see issue #12). This is a known correctness gap for the re-ingest case.
+
+### Gap 6 — No end-to-end integration test
+
+All existing tests run fully offline (mocked arro-server). There is no test that spins up a real arro-server instance, ingests CVE documents, and asserts that search returns the correct results. This gap means a silent protocol mismatch between `arro-nlp-frontend` and `arro-server` would not be caught by CI.
+
+A minimal `tests/integration/test_e2e.py` with a Docker Compose fixture (`arro-server` + `arro-nlp-frontend`) is needed before the system goes to production.
+
+### Gap 7 — No deployment configuration
+
+There is no `Dockerfile`, `docker-compose.yml`, or `k8s/` manifest for `arro-nlp-frontend`. Running the full stack (`arro-server` + `arro-nlp-frontend` + a mounted Zarr volume) requires manual setup. A `docker-compose.yml` that wires the two services together and sets all required env vars is the minimum needed for a reproducible deployment.
+
+---
+
+## Recommended next steps (ordered)
+
+1. **Merge PR #20** (per-dataset lock) — clean, reviewed, CI should go green.
+2. **Implement `arro-cve-search#9`** (CVE ingest harness) using the v2 `/ingest` API with `dataset_id: "cve/embeddings"`. Decide on data source (Gap 3) first.
+3. **Implement issue #8** (`GET/DELETE /documents/{doc_id}`) — needed for CVE withdrawal handling.
+4. **Implement `arro-cve-search#10`** (query CLI or web UI) — makes the product usable.
+5. **Write `docker-compose.yml`** for `arro-server` + `arro-nlp-frontend` — prerequisite for integration testing and deployment.
+6. **Write `tests/integration/test_e2e.py`** — end-to-end smoke test with real arro-server.
 
 ---
 
 # Codebase Analysis
 
-*As of PR #16. Every section covers one architectural layer: design rationale, the specific risks introduced by that design, and the correct future path.*
+*As of PR #20 (open). Every section covers one architectural layer: design rationale, the specific risks introduced by that design, and the correct future path.*
 
 ---
 
@@ -38,14 +131,14 @@
 
 ### Risks
 
-- **Silent mis-configuration at scale.** `arro_server_dataset_id` and `arro_server_root_label` have string defaults (`"cve/embeddings"`, `"main"`) with no validation that they match what arro-server has registered. A wrong `dataset_id` causes silent 404s from `dataset_metadata()` (treated as "new dataset") and a fresh Zarr upload that replaces the existing index. No warning is emitted.
-- **`ingest_batch_size` is module-level.** `EMBED_CHUNK = settings.ingest_batch_size` is evaluated at import time in `ingest.py`. Changing the env var at runtime has no effect without a server restart. This is intentional but undocumented.
+- **Silent mis-configuration at scale.** `arro_server_root_label` has a string default (`"main"`) with no validation that it matches what arro-server has registered. A wrong `dataset_id` in a request causes a silent 404 from `dataset_metadata()` (treated as "new dataset") and a fresh Zarr upload that replaces the existing index.
+- **`ingest_batch_size` is module-level.** `EMBED_CHUNK = settings.ingest_batch_size` is evaluated at import time in `ingest.py`. Changing the env var at runtime has no effect without a server restart.
 - **No config schema export.** There is no `/config` or `/settings` endpoint. Operators cannot introspect active config without reading env/logs.
 
 ### Future work
 
 - Add a `GET /admin/config` endpoint (read-only, redact secrets) for operator visibility.
-- Add a validator that pings arro-server at startup and logs a warning if `dataset_id` does not match any registered dataset.
+- Add a startup validator that pings arro-server and logs a warning if the `root_label` does not match any registered root.
 - Document `EMBED_CHUNK` import-time evaluation in the field docstring.
 
 ---
@@ -54,20 +147,20 @@
 
 ### Design
 
-Two backends: `local` (SentenceTransformer, default `all-MiniLM-L6-v2`, 384-dim) and `openai`. Vectors are **never L2-normalised** — arro-server expects raw scaled vectors and manages its own spectral distance. `scale_factor` is applied uniformly post-encoding. Empty input returns `(0, dim)` without raising. Fails loud at construction if `model_path` is set but does not exist on disk, preventing silent vector distribution mixing.
+Two backends: `local` (SentenceTransformer, default `all-MiniLM-L6-v2`, 384-dim) and `openai`. Vectors are **never L2-normalised** — arro-server expects raw scaled vectors and manages its own spectral distance. `scale_factor` is applied uniformly post-encoding. Fails loud at construction if `model_path` is set but does not exist on disk.
 
 ### Risks
 
-- **`dim` property lies for OpenAI backend.** `dim` returns `384` hardcoded for OpenAI because `_client` has no `.get_embedding_dimension()`. If the operator sets `EMBED_BACKEND=openai` with `text-embedding-3-large` (3072-dim), `dim` returns 384 and the Zarr array is created with `shape=(N, 384)` — truncating or erroring silently depending on NumPy behaviour.
-- **`encode_batch` is synchronous and CPU-bound, called inside the async event loop.** For the local backend, `SentenceTransformer.encode()` blocks the event loop for the full embedding duration. Under concurrent ingest requests this does not cause corruption (the lock is acquired *after* embedding), but it does block all other async work including search requests and health checks. For a single worker handling mixed load, a 1000-doc ingest batch can block the event loop for several seconds.
-- **No text length validation.** `IngestItem.text` has `min_length=1` but no `max_length`. Feeding a 100K-token document to `all-MiniLM-L6-v2` does not raise — SentenceTransformer silently truncates at 256 or 512 tokens depending on model config. The stored `text` is the full original, but the embedding represents only the truncated prefix. Search quality degrades silently.
-- **`scale_factor` interaction with arro-server tau.** The tau parameter in arro-server assumes a specific vector distribution. Applying an arbitrary `scale_factor != 1.0` shifts norms and can invalidate tau thresholds calibrated on unit-norm vectors. No warning is logged when `scale_factor != 1.0`.
+- **`dim` property lies for OpenAI backend.** `dim` returns `384` hardcoded. If the operator uses `text-embedding-3-large` (3072-dim), the Zarr array is created with `shape=(N, 384)` — silent truncation.
+- **`encode_batch` is synchronous and CPU-bound, called inside the async event loop.** Blocks the event loop for the full embedding duration. Under concurrent load this blocks search and health check responses.
+- **No text length validation.** `IngestItem.text` has `min_length=1` but no `max_length`. SentenceTransformer silently truncates at the model token limit; the stored text is the full original but the embedding represents only the prefix.
+- **`scale_factor` interaction with arro-server tau.** Applying `scale_factor != 1.0` shifts vector norms and can invalidate tau thresholds calibrated on unit-norm vectors.
 
 ### Future work
 
-- Fix `dim` for OpenAI: call `client.models.retrieve(model_name)` or maintain a `{model: dim}` lookup table.
+- Fix `dim` for OpenAI: maintain a `{model: dim}` lookup table.
 - Offload `encode_batch` to a thread pool: `await asyncio.get_event_loop().run_in_executor(None, embedder.encode_batch, texts)`.
-- Add `max_length: int` field to `IngestItem` (default 2048 chars) with a validator that truncates with a warning log.
+- Add `max_length: int` field to `IngestItem` (default 2048 chars) with a validator.
 - Log a `WARNING` when `scale_factor != 1.0` at embedder construction time.
 
 ---
@@ -76,22 +169,20 @@ Two backends: `local` (SentenceTransformer, default `all-MiniLM-L6-v2`, 384-dim)
 
 ### Design
 
-Stdlib `sqlite3` only — no ORM. WAL journal mode for concurrent reads. `upsert_batch` is atomic (single transaction). `row_index = MAX(row_index) + 1`, not `COUNT(*)`, to survive soft deletes. `delete_by_id` is a soft delete: the vector in arro-server's Zarr array is never removed. Vectors are stored as raw `BLOB` (NumPy `.tobytes()` / `np.frombuffer`) alongside the document.
+Stdlib `sqlite3` only — no ORM. WAL journal mode. `upsert_batch` is atomic. `row_index = MAX(row_index) + 1` scoped to `dataset_id`, not `COUNT(*)`. `delete_by_id` is a soft delete. As of PR #18: `PRIMARY KEY (dataset_id, row_index)`, fully multi-dataset. Schema versioned at `_SCHEMA_VERSION = 2`. v1 databases detected at startup with a `RuntimeError` pointing at the migration command.
 
 ### Risks
 
-- **`asyncio.Lock` does not protect multi-worker or multi-replica deployments.** The lock serialises access within a single event loop. With `uvicorn --workers 4`, four processes share the same SQLite file but each has its own `asyncio.Lock`. Two workers can read the same `MAX(row_index)` simultaneously and assign the same `start_row`. The resulting Zarr upload from worker B will overwrite worker A's upload with a matrix that is missing A's documents. Data loss, no error.
-- **Re-ingest with existing `doc_id` creates a ghost vector.** `INSERT OR REPLACE` deletes the old row and inserts a new one. If `doc_id="CVE-1"` was at `row_index=0` and is re-ingested, the new row gets `row_index = next_row_index()` (e.g. 42). The Zarr rewrite includes the new vector at position 42 and the old position 0 is now empty in SQLite — but arro-server's previous index still has the old embedding at index 0. Until the next successful ingest triggers a Zarr rewrite and `build_index`, search can return ghost hits at index 0 with no matching document in the store. `search.py` handles this gracefully (skip + log), but the degradation period is unbounded.
-- **`get_all_vectors()` reads the full matrix into RAM on every ingest.** For 100K documents at 384-dim float64: 100K × 384 × 8 bytes = ~300MB per ingest call. This is read, assembled in Python, written to Zarr, then discarded. Peak RSS during ingest ≈ 2× the matrix size (Python list + NumPy stack).
-- **`check_same_thread=False` with a future `run_in_executor` is a trap.** If any future code moves SQLite calls into a thread pool executor, the `asyncio.Lock` no longer protects them — it is not a threading lock. The code is safe today because everything runs on the event loop thread, but the invariant is fragile and undocumented.
-- **No migration path.** There is no schema versioning. Adding a column requires dropping and recreating the table. The `vector BLOB` column is new in PR #11 — any existing deployment with a pre-#11 SQLite file will fail silently (the column is absent, `get_all_vectors()` returns an empty array).
+- **`asyncio.Lock` does not protect multi-worker or multi-replica deployments.** With `uvicorn --workers 4`, four processes share the same SQLite file but each has its own lock. Two workers can compute the same `start_row` simultaneously and corrupt the index. Data loss, no error.
+- **Re-ingest with existing `doc_id` creates a ghost vector.** `INSERT OR REPLACE` assigns a new `row_index` on re-ingest. The old Zarr slot is orphaned until the next `build_index` run. `search.py` skips ghost rows gracefully but the degradation window is unbounded.
+- **`get_all_vectors()` reads the full dataset matrix into RAM on every ingest.** At 100K docs × 384-dim float64: ~300MB per ingest call. Peak RSS ≈ 2× matrix size.
+- **`check_same_thread=False` with a future `run_in_executor` is a trap.** The `asyncio.Lock` is not a threading lock. If any future code moves SQLite calls to a thread pool, the lock no longer protects them.
 
 ### Future work
 
-- Add `BEGIN EXCLUSIVE` transaction for `next_row_index` + `upsert_batch` to protect multi-worker deployments on the same host (SQLite-level advisory lock, compatible with WAL).
-- Implement `POST /admin/reindex`: truncate store, re-embed all documents, rewrite Zarr from scratch. Required before multi-replica is safe.
-- Add schema version table and a startup migration check that fails loud if the schema is stale.
-- Cap `get_all_vectors()` with a configurable `max_ingest_rows` setting; above the cap, require explicit `POST /admin/reindex` instead of inline rewrite.
+- Wrap `next_row_index` + `upsert_batch` in `BEGIN EXCLUSIVE` SQLite transaction for multi-worker safety.
+- Cap `get_all_vectors()` with a configurable `max_ingest_rows` setting.
+- Add `POST /admin/reindex` for ghost vector cleanup.
 - Document the `asyncio.Lock` + `check_same_thread=False` invariant in the store docstring.
 
 ---
@@ -100,21 +191,19 @@ Stdlib `sqlite3` only — no ORM. WAL journal mode for concurrent reads. `upsert
 
 ### Design
 
-Thin async HTTP wrapper using `httpx.AsyncClient`. Single responsibility: translate HTTP ↔ Python types. All methods raise `ArroServerError` on non-2xx or network failure. Five methods: `dataset_metadata`, `upload_init`, `upload_commit`, `build_index`, `search`. The `search()` method sends `{vector, k, tau, mode="tau"}` to `POST /api/datasets/{id}/search`.
+Thin async HTTP wrapper using `httpx.AsyncClient`. As of PR #18: `dataset_id` is a per-call argument on all 5 methods, not a constructor singleton. Raises `ArroServerError` on any non-2xx or network failure.
 
 ### Risks
 
-- **No retry logic.** A transient 503 from arro-server during `upload_commit` causes a 502 to the caller and leaves the store written but arro-server unsynced. There is no automatic retry and no dead-letter queue. The self-healing mechanism (next ingest rewrites Zarr) only works if another ingest happens — for low-traffic deployments, the index can stay stale indefinitely.
-- **`vector.tolist()` in `search()` is a Python-level serialisation bottleneck.** A single 384-dim float64 vector → JSON string ≈ 3KB. This is negligible for search (one vector per request). For ingest, the same pattern applied to the full matrix (see `store.py` risks) is the primary bottleneck.
-- **`timeout=30.0` is a single scalar.** `build_index` on a large dataset can take minutes. With `timeout=30.0`, a legitimate long-running index build will raise `httpx.ReadTimeout` → `ArroServerError` → 502, leaving the index rebuild aborted mid-flight with no way to poll status.
-- **No connection pooling configuration.** `httpx.AsyncClient` pools connections by default, but there is no explicit configuration of pool size, keepalive, or TLS settings. In a high-ingest scenario with many concurrent `upload_commit` calls (if the lock is ever relaxed), connection exhaustion is possible.
-- **`aclose()` is only called from lifespan shutdown.** If the process is killed (SIGKILL), the httpx client is not closed. This is acceptable for stateless HTTP but worth documenting.
+- **No retry logic.** A transient 503 during `upload_commit` causes a 502 to the caller and leaves the index stale. The self-healing mechanism (next ingest rewrites Zarr) only works if another ingest happens.
+- **`timeout=30.0` for all methods.** `build_index` on a large dataset can take minutes. The scalar timeout will abort a legitimate long-running index build with a `ReadTimeout` → 502.
+- **No connection pooling configuration.** Pool size, keepalive, and TLS settings are httpx defaults.
 
 ### Future work
 
-- Add `tenacity`-based retry with exponential backoff for `upload_commit` and `build_index` (idempotent operations).
-- Use a separate, longer timeout for `build_index` (e.g. `timeout=600.0`) or implement an async poll loop against a `GET /api/datasets/{id}/index/status` endpoint if arro-server exposes one.
-- Consider Arrow IPC or msgpack for vector payloads once arro-server supports it — reduces search payload from ~3KB JSON to ~1.5KB binary per 384-dim vector.
+- Add `tenacity`-based retry with exponential backoff for `upload_commit` and `build_index`.
+- Use a separate, longer timeout for `build_index` (e.g. `timeout=600.0`) or implement an async poll loop.
+- Consider Arrow IPC or msgpack for vector payloads once arro-server supports it.
 
 ---
 
@@ -122,21 +211,21 @@ Thin async HTTP wrapper using `httpx.AsyncClient`. Single responsibility: transl
 
 ### Design
 
-Two-phase pipeline: embed outside the lock (CPU-bound, no shared state), then acquire `asyncio.Lock` for the atomic SQLite write + Zarr rewrite. SQLite is written first — a 502 from arro-server leaves the document in the store but the index stale. The next successful ingest self-heals by rewriting the full Zarr. Index rebuild is triggered only when `index_stale=True` or the dataset is new.
+Two-phase pipeline: embed outside the lock (CPU-bound, no shared state), then acquire the per-dataset lock for `next_row_index → upsert_batch → Zarr rewrite`. SQLite is written first — 502 from arro-server leaves the document locally but the index stale; the next successful ingest self-heals.
+
+As of PR #20: `dataset_id` is required in the request body. The lock is a per-dataset `asyncio.Lock` from `app.state.ingest_locks`, created lazily via `_get_dataset_lock()`. Concurrent requests to different datasets now run in parallel.
 
 ### Risks
 
-- **Full Zarr rewrite on every ingest is O(N) in dataset size.** Every ingest — even a single document — reads all N vectors from SQLite, writes a new Zarr array of shape (N, dim), and calls `upload_commit`. At 100K documents: ~300MB read + ~300MB write per ingest call. Ingest throughput degrades linearly as the dataset grows.
-- **The lock holds during the full Zarr write.** The `asyncio.Lock` is held from `next_row_index()` through `build_index()`. For a large dataset, the lock is held for the duration of the Zarr write (potentially tens of seconds). All concurrent ingest requests queue behind it. Search requests are unaffected (no lock), but ingest throughput is effectively serialised.
-- **No batch size cap at the endpoint level.** `IngestRequest.documents` has `min_length=1` but no `max_length`. A single request with 10K documents triggers a 10K-document embed + a full Zarr rewrite of N+10K vectors. OOM is possible on small deployments.
-- **`EMBED_CHUNK` is module-level at import time.** Changing `INGEST_BATCH_SIZE` env var requires a server restart.
+- **Full Zarr rewrite on every ingest is O(N) in dataset size.** Every ingest — even a single document — reads all N vectors, writes a new Zarr array, and calls `upload_commit`. At 100K documents: ~300MB read + ~300MB write per call.
+- **Lock held for the full Zarr write.** The lock is held from `next_row_index()` through `build_index()`. For a large dataset this serialises all ingest requests for tens of seconds.
+- **No batch size cap.** `IngestRequest.documents` has `min_length=1` but no `max_length`. OOM is possible on small deployments.
 
 ### Future work
 
 - Add `max_length=500` (configurable) to `IngestRequest.documents`.
-- Investigate append-only Zarr writes (arro-server permitting) to avoid full rewrites: `upload_init` with an `append` mode, write only the new rows, `upload_commit`. This changes the ingest pipeline from O(N) to O(batch).
-- Move `EMBED_CHUNK` to a per-request resolved value from `settings` rather than a module-level constant.
-- Add `POST /admin/reindex` for full rebuild after arro-server downtime or schema migration.
+- Investigate append-only Zarr writes to eliminate O(N) rewrite.
+- Release lock after SQLite write; move Zarr rewrite outside the lock scope.
 
 ---
 
@@ -144,21 +233,21 @@ Two-phase pipeline: embed outside the lock (CPU-bound, no shared state), then ac
 
 ### Design
 
-Pure read path — no lock. Embeds the query into a single vector, calls arro-server, hydrates each returned `row_index` from SQLite. Ghost rows (soft-deleted or stale) are silently skipped with a `WARNING` log. Ranks are resequenced `1..N` after any skips. `tau` defaults to `settings.arro_server_search_tau` but can be overridden per-request.
+Pure read path — no lock. As of PR #18: `dataset_id` is required in the request body, forwarded to `arro_client.search()` and `store.get_by_row()`. Ghost rows are silently skipped. Ranks are resequenced `1..N` after any skips.
 
 ### Risks
 
-- **`encode_batch([query])[0]` is synchronous and blocks the event loop.** Same issue as ingest: a single query embedding call blocks the event loop for ~5–50ms depending on hardware. Under high search concurrency this is a meaningful bottleneck. A 50ms embed × 20 concurrent queries = 1 second of sequential blocking on a single worker.
-- **No result deduplication.** If arro-server returns the same `row_index` twice (arro-server bug or index corruption), the store returns the same document twice with different ranks. The response will contain duplicate `doc_id` values with no error.
-- **`query_time_ms` includes only endpoint time, not arro-server latency breakdown.** Callers cannot distinguish a slow embed from a slow arro-server call from a slow SQLite hydration. Useful for debugging, but structurally incomplete for SLA monitoring.
-- **No caching.** Identical repeated queries embed, call arro-server, and hydrate from SQLite every time. For a CVE search use case where the same queries recur frequently (e.g. `"buffer overflow"`, `"SQL injection"`), a simple LRU cache on the (query, top_k, tau) tuple would eliminate arro-server calls for hot queries.
+- **`encode_batch([query])[0]` is synchronous and blocks the event loop.** ~5–50ms per query depending on hardware. Under high concurrency this is a meaningful bottleneck.
+- **No result deduplication.** If arro-server returns the same `row_index` twice, the response contains duplicate `doc_id` values.
+- **`query_time_ms` is a single scalar.** Callers cannot distinguish slow embed from slow arro-server from slow SQLite hydration.
+- **No caching.** Repeated identical queries re-embed and re-call arro-server every time.
 
 ### Future work
 
-- Offload `encode_batch` to `run_in_executor` for both ingest and search.
+- Offload `encode_batch` to `run_in_executor`.
 - Add deduplication: after hydration, deduplicate by `doc_id`, keep highest-score hit.
-- Add structured timing to response: `{"embed_ms", "search_ms", "hydrate_ms"}` inside `SearchResponse` (behind a `debug=true` query param to avoid bloating normal responses).
-- Add optional LRU cache for (query_hash, top_k, tau) → results with a configurable TTL.
+- Add structured timing: `{embed_ms, search_ms, hydrate_ms}` behind a `debug=true` query param.
+- Add optional LRU cache for `(query_hash, top_k, tau)` → results with configurable TTL.
 
 ---
 
@@ -167,20 +256,22 @@ Pure read path — no lock. Embeds the query into a single vector, calls arro-se
 | Dimension | Current limit | Root cause | Correct fix |
 |---|---|---|---|
 | Dataset size | ~50K docs before ingest becomes slow | O(N) Zarr rewrite per ingest | Append-only Zarr writes |
-| Ingest throughput | 1 concurrent ingest (lock held for full Zarr write) | `asyncio.Lock` scope too wide | Release lock after SQLite write; move Zarr rewrite outside lock |
+| Ingest throughput (same dataset) | 1 concurrent (lock held for full Zarr write) | `asyncio.Lock` scope too wide | Release lock after SQLite write; move Zarr rewrite outside lock |
+| Ingest throughput (different datasets) | N concurrent (per-dataset lock) | ✅ Fixed in PR #20 | — |
 | Search concurrency | Degrades under load | Sync embed blocks event loop | `run_in_executor` for embed |
 | Multi-worker (`--workers N`) | **Broken** — row index corruption | `asyncio.Lock` is process-local | SQLite `BEGIN EXCLUSIVE` or ingest queue |
 | Multi-replica (K8s) | **Broken** — same as multi-worker | Same root cause | Distributed advisory lock or message queue |
-| Re-ingest existing doc_id | Ghost vectors accumulate over time | Zarr has no point-delete | Option A: `409 Conflict`; Option B: append + soft-delete at search time |
+| Re-ingest existing `doc_id` | Ghost vectors accumulate | Zarr has no point-delete | `409 Conflict` or append + soft-delete at search time |
 | Large single document | Silent truncation at model token limit | No `max_length` on `IngestItem.text` | Add `max_length` field + validator |
 | Large batch | OOM risk | No `max_length` on `IngestRequest.documents` | Add `max_length=500` |
 
 ---
 
-## Known open issues (created during analysis)
+## Known open issues
 
 | Issue | Title | Priority |
 |---|---|---|
+| [#8](https://github.com/Genefold/arro-nlp-frontend/issues/8) | `GET/DELETE /documents/{doc_id}` | Medium |
 | [#12](https://github.com/Genefold/arro-nlp-frontend/issues/12) | Re-ingest creates ghost vectors in arro-server | High |
 | [#13](https://github.com/Genefold/arro-nlp-frontend/issues/13) | `asyncio.Lock` does not protect multi-worker or multi-replica | High |
 | [#14](https://github.com/Genefold/arro-nlp-frontend/issues/14) | `vectors.tolist()` + JSON does not scale for large batches | Medium |
@@ -190,127 +281,37 @@ Pure read path — no lock. Embeds the query into a single vector, calls arro-se
 
 ## Phased delivery roadmap
 
-### Phase 1 — Complete the current feature set (now)
+### Phase 1 — Complete the core feature set (now)
 
-- Merge PR #16 (`POST /search`)
-- Implement issue #8 (`GET/DELETE /documents/{doc_id}`)
-- Implement cve-search issue #9 (CVE ingest harness)
+1. Merge PR #20 (per-dataset lock — reviewed, clean).
+2. Implement `arro-cve-search#9`: CVE ingest harness targeting v2 API (`dataset_id: "cve/embeddings"`).
+3. Implement issue #8: `GET/DELETE /documents/{doc_id}`.
 
-### Phase 2 — Correctness & safety (next)
+### Phase 2 — Make it usable as a product
 
-These are not optimisations — they fix silent data corruption:
+1. Implement `arro-cve-search#10` (or equivalent): query CLI or minimal web UI.
+2. Write `docker-compose.yml` wiring `arro-server` + `arro-nlp-frontend` with shared Zarr volume and all required env vars.
+3. Write `tests/integration/test_e2e.py`: spin up real arro-server via Docker Compose, ingest 10 CVEs, assert search returns correct results.
+
+### Phase 3 — Correctness & safety
+
+These fix silent data corruption, not features:
 
 1. **Fix re-ingest ghost vectors** (issue #12): return `409 Conflict` on re-ingest of existing `doc_id` until append+rebuild is implemented.
-2. **Fix multi-worker row index race** (issue #13): wrap `next_row_index` + `upsert_batch` in `BEGIN EXCLUSIVE` SQLite transaction, or enforce `--workers 1` at startup with a hard check.
-3. **Add schema migration** (no issue yet): version table + startup check, fail loud if stale.
-4. **Fix OpenAI `dim` property** (no issue yet): lookup table or API call, not hardcoded 384.
+2. **Fix multi-worker row index race** (issue #13): wrap `next_row_index` + `upsert_batch` in `BEGIN EXCLUSIVE` SQLite transaction, or enforce `--workers 1` at startup.
+3. **Fix OpenAI `dim` property**: `{model: dim}` lookup table, not hardcoded 384.
+4. **Add text length validation**: `max_length` on `IngestItem.text`.
 
-### Phase 3 — Performance (when dataset > 10K docs)
+### Phase 4 — Performance (when dataset > 10K docs)
 
-1. **Offload embed to thread pool** (`run_in_executor` for both ingest and search).
-2. **Release lock after SQLite write**: move Zarr rewrite outside the `asyncio.Lock` scope. This requires arro-server to tolerate a brief window where SQLite and the Zarr index are temporarily out of sync.
-3. **Cap ingest batch size**: add `max_length=500` to `IngestRequest.documents`.
-4. **Add `POST /admin/reindex`**: full rebuild for post-downtime recovery and ghost vector cleanup.
+1. Offload embed to thread pool (`run_in_executor` for both ingest and search).
+2. Release lock after SQLite write; move Zarr rewrite outside the lock scope.
+3. Cap ingest batch size: `max_length=500` on `IngestRequest.documents`.
+4. Add `POST /admin/reindex`: full rebuild for post-downtime recovery and ghost vector cleanup.
 
-### Phase 4 — Scale-out (when single-process is insufficient)
+### Phase 5 — Scale-out (when single-process is insufficient)
 
-1. **Append-only Zarr writes**: eliminate O(N) rewrite per ingest; requires arro-server API extension.
-2. **Multi-worker safety**: replace `asyncio.Lock` with SQLite `BEGIN EXCLUSIVE` (same-host multi-worker) or an external queue (ARQ + Redis for multi-host).
-3. **Search LRU cache**: cache (query_hash, top_k, tau) → results with configurable TTL.
-4. **Arrow IPC vector transport**: replace JSON serialisation with Arrow IPC for ingest and search payloads.
-
-
-
-7 open issues. Here is the ordered implementation checklist with the dependency graph made explicit.
-
-***
-
-## Implementation Checklist — `arro-nlp-frontend`
-
-### 🔴 Step 1 — Merge PR #18 first (prerequisite for everything below)
-
-Issue (https://github.com/Genefold/arro-nlp-frontend/issues/17) is already implemented in PR #18, currently waiting on reviewer approval . Nothing below can be started cleanly until `feat/multidataset-serving` is on `main`.
-
-***
-
-### 🟠 Step 2 — Issue (https://github.com/Genefold/arro-nlp-frontend/issues/19) · Per-dataset ingest lock
-**Depends on:** PR #18 merged  
-**Effort:** ~15 lines of code, spec fully written in the issue
-
-- [ ] Change `app.state.ingest_lock: asyncio.Lock` → `app.state.ingest_locks: dict[str, asyncio.Lock]` in `main.py`
-- [ ] Add `_get_dataset_lock(locks, dataset_id)` helper in `ingest.py`
-- [ ] Replace `async with req.app.state.ingest_lock` with `async with lock` using the helper
-- [ ] Update `conftest.py` fixtures: inject `ingest_locks = {}` instead of `ingest_lock`
-- [ ] Add `test_ingest_concurrent_batches_different_datasets_do_not_block`
-- [ ] Add `test_ingest_concurrent_batches_same_dataset_still_serialised`
-- [ ] Remove `LOCK IS GLOBAL ACROSS ALL DATASETS` block from docstring; keep `SINGLE-PROCESS GUARANTEE ONLY` block
-
-***
-
-### 🟡 Step 3 — Issue (https://github.com/Genefold/arro-nlp-frontend/issues/8) · `GET/DELETE /documents/{doc_id}`
-**Depends on:** PR #18 merged (needs `dataset_id` in all store calls)  
-**Effort:** new router file + 6 tests
-
-- [ ] Create `src/arro_nlp_frontend/router/documents.py`
-- [ ] Implement `GET /documents/{doc_id}` → `DocumentResponse` (200) or 404
-- [ ] Implement `DELETE /documents/{doc_id}` → `DeleteResponse` (200) or 404
-- [ ] Add `DocumentResponse` and `DeleteResponse` to `models.py`
-- [ ] Register the documents router in `main.py`
-- [ ] Write `tests/test_documents.py` (6 tests: get existing, get missing, delete existing, delete missing, delete-then-get, delete doesn't affect others)
-- [ ] Document in the DELETE docstring: soft-delete only, vector stays in arro-server Zarr
-
-***
-
-### 🟡 Step 4 — Issue (https://github.com/Genefold/arro-nlp-frontend/issues/12) · Re-ingest ghost vector bug
-**Depends on:** Issue #8 (`DELETE` endpoint) so callers have a path to remove before re-ingesting  
-**Effort:** 1 guard in `ingest.py` + 1 test
-
-- [ ] In `ingest.py`, before computing `next_row_index`, check if any `doc_id` in the batch already exists in the store
-- [ ] Return `409 Conflict` if a duplicate `doc_id` is found (body: which IDs conflict)
-- [ ] Add `test_ingest_existing_doc_id_returns_409`
-- [ ] Update docstring: re-ingest forbidden, callers must `DELETE` first
-
-***
-
-### 🔵 Step 5 — Issue (https://github.com/Genefold/arro-nlp-frontend/issues/15) · Typed `app.state`
-**Depends on:** nothing — but best done after steps 2–4 so the final shape of `AppState` is stable  
-**Effort:** 1 new file + minor edits to 2 files
-
-- [ ] Create `src/arro_nlp_frontend/state.py` with `AppState` dataclass and `get_state(req)` accessor
-- [ ] Update `AppState` field `ingest_lock` → `ingest_locks: dict[str, asyncio.Lock]` (from step 2)
-- [ ] Update `main.py` lifespan to set `app.state._app_state = AppState(...)`
-- [ ] Update `ingest.py` (and any future endpoint) to call `get_state(req)` instead of `req.app.state.*`
-- [ ] Verify `mypy src/` passes with no `attr-defined` errors
-
-***
-
-### 🔵 Step 6 — Issue (https://github.com/Genefold/arro-nlp-frontend/issues/13) · Multi-worker safety
-**Depends on:** nothing blocking, but low urgency  
-**Effort:** documentation + 1 startup warning, no code logic change yet
-
-- [ ] Add prominent `⚠️ WORKERS=1 ONLY` warning to `README.md` and startup logs
-- [ ] In `lifespan()`, log a `WARNING` if the process detects it may not be the only worker (best-effort)
-- [ ] Document the `BEGIN EXCLUSIVE` path as the eventual fix in the issue/comments
-
-***
-
-### ⚪ Step 7 — Issue (https://github.com/Genefold/arro-nlp-frontend/issues/14) · Binary vector transport
-**Depends on:** nothing, but requires arro-server API alignment first  
-**Effort:** `ArroClient` transport change only, isolated behind the existing abstraction boundary
-
-- [ ] Short term: add `max_batch_size: int = Field(200, le=500)` to `IngestRequest`
-- [ ] Long term (when arro-server supports it): replace `vectors.tolist()` + JSON with Arrow IPC in `ArroClient.push_vectors()`
-
-***
-
-## Dependency order at a glance
-
-```
-PR #18 merge
-    └── #19  (per-dataset lock)          ← do immediately after merge
-    └── #8   (GET/DELETE documents)      ← do immediately after merge
-         └── #12 (409 on re-ingest)      ← needs DELETE to exist first
-    └── #15  (typed app.state)           ← after #19 so AppState shape is final
-    └── #13  (multi-worker docs)         ← anytime, low effort
-    └── #14  (binary transport)          ← last, needs arro-server coordination
-```
+1. Append-only Zarr writes: eliminate O(N) rewrite per ingest; requires arro-server API extension.
+2. Multi-worker safety: `BEGIN EXCLUSIVE` (same-host) or ARQ + Redis queue (multi-host).
+3. Search LRU cache: cache `(query_hash, top_k, tau)` → results with configurable TTL.
+4. Arrow IPC vector transport: replace JSON with Arrow IPC for ingest and search payloads.

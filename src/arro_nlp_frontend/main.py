@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
     app.state.embedder = Embedder.from_settings()
     app.state.store = DocumentStore(Path(settings.store_db_path))
-    app.state.ingest_locks = {}
+    app.state.ingest_locks: dict[str, asyncio.Lock] = {}
     app.state.arro_client = ArroClient(base_url=settings.arro_server_url)
 
     logger.info(

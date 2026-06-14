@@ -341,7 +341,7 @@ def test_ingest_build_index_when_new_dataset(ingest_client):
 
 
 def test_ingest_zarr_array_written_with_correct_vectors(ingest_client):
-    """Vectors actually written to Zarr array — not empty."""
+    """Vectors actually written to Zarr array -- not empty."""
     client, store, _ = ingest_client
     mock_open, written = _zarr_mock()
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
@@ -422,7 +422,7 @@ def test_ingest_concurrent_batches_different_datasets_do_not_block(
     """Two concurrent requests targeting DIFFERENT datasets run in parallel.
 
     With a global lock they would serialise; with per-dataset locks they do not.
-    We verify correctness only (no timing assertion — fragile in CI):
+    We verify correctness only (no timing assertion -- fragile in CI):
       - ds/a gets row_index=0
       - ds/b gets row_index=0  (independent counter)
       - No collision, no exception.
@@ -462,8 +462,6 @@ def test_ingest_concurrent_batches_different_datasets_do_not_block(
             _post_ds("ds/a", "doc-a"),
             _post_ds("ds/b", "doc-b"),
         )
-        # Each dataset has an independent row_index counter, so both
-        # requests see 0 as their first available index.
         assert idx_a == 0, f"ds/a got row {idx_a}, expected 0"
         assert idx_b == 0, f"ds/b got row {idx_b}, expected 0"
 

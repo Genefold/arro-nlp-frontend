@@ -97,7 +97,7 @@ async def ingest(
     Pipeline:
       1. Validate: non-empty list, no duplicate doc_ids within the batch
       2. Embed texts in chunks of EMBED_CHUNK -> float64 array (N, dim)
-      2a. (inside lock) — per-dataset lock acquired via `_get_dataset_lock`
+      2a. (inside lock) -- per-dataset lock acquired via `_get_dataset_lock`
       3. (inside lock) start_row = store.next_row_index()
       4. (inside lock) upsert_batch into SQLite with vectors
       5. (inside lock) Sync to arro-server:
@@ -120,7 +120,7 @@ async def ingest(
 
     root_label = request.root_label or settings.arro_server_root_label
 
-    # Step 1 — validate: no duplicate doc_ids within this batch
+    # Step 1 -- validate: no duplicate doc_ids within this batch
     doc_ids = [item.doc_id for item in request.documents]
     if len(doc_ids) != len(set(doc_ids)):
         seen: set[str] = set()
@@ -134,13 +134,13 @@ async def ingest(
             detail=f"Duplicate doc_ids in request: {duplicates}",
         )
 
-    # Step 2 — embed in chunks to avoid OOM on large requests
+    # Step 2 -- embed in chunks to avoid OOM on large requests
     texts = [item.text for item in request.documents]
     chunks = [texts[i : i + EMBED_CHUNK] for i in range(0, len(texts), EMBED_CHUNK)]
     parts = [embedder.encode_batch(chunk) for chunk in chunks]
     vectors = np.vstack(parts) if len(parts) > 1 else parts[0]
 
-    # Steps 3-5 — inside the lock: start_row is stable for the duration
+    # Steps 3-5 -- inside the lock: start_row is stable for the duration
     lock = _get_dataset_lock(req.app.state.ingest_locks, request.dataset_id)
     async with lock:
         start_row = store.next_row_index(dataset_id=request.dataset_id)
@@ -157,7 +157,7 @@ async def ingest(
         ]
         statuses = store.upsert_batch(request.dataset_id, start_row, documents, vectors)
 
-        # Step 5 — Sync to arro-server via Zarr rewrite
+        # Step 5 -- Sync to arro-server via Zarr rewrite
         try:
             # 5a. Read ALL current vectors from store
             all_vectors = store.get_all_vectors(dataset_id=request.dataset_id)
