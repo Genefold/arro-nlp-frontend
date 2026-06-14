@@ -36,8 +36,21 @@ class IngestItem(BaseModel):
 
 
 class IngestRequest(BaseModel):
+    """Request body for POST /ingest."""
+
     dataset_id: str = Field(
-        default="default", description="Dataset namespace for per-dataset locking"
+        ...,
+        min_length=1,
+        description=(
+            "arro-server dataset identifier, e.g. 'cve/embeddings' or 'nvd/embeddings'. "
+            "All documents in this batch are associated with this dataset."
+        ),
+    )
+    root_label: str = Field(
+        default="",
+        description=(
+            "arro-server data root label. Defaults to settings.arro_server_root_label when empty."
+        ),
     )
     documents: list[IngestItem] = Field(..., min_length=1)
 
@@ -105,6 +118,8 @@ async def ingest(
     store = req.app.state.store
     arro_client = req.app.state.arro_client
 
+    root_label = request.root_label or settings.arro_server_root_label
+
     # Step 1 — validate: no duplicate doc_ids within this batch
     doc_ids = [item.doc_id for item in request.documents]
     if len(doc_ids) != len(set(doc_ids)):
@@ -128,7 +143,7 @@ async def ingest(
     # Steps 3-5 — inside the lock: start_row is stable for the duration
     lock = _get_dataset_lock(req.app.state.ingest_locks, request.dataset_id)
     async with lock:
-        start_row = store.next_row_index()
+        start_row = store.next_row_index(dataset_id=request.dataset_id)
 
         documents = [
             Document(
@@ -140,22 +155,24 @@ async def ingest(
             )
             for i, item in enumerate(request.documents)
         ]
-        statuses = store.upsert_batch(start_row, documents, vectors)
+        statuses = store.upsert_batch(request.dataset_id, start_row, documents, vectors)
 
         # Step 5 — Sync to arro-server via Zarr rewrite
         try:
             # 5a. Read ALL current vectors from store
-            all_vectors = store.get_all_vectors()
+            all_vectors = store.get_all_vectors(dataset_id=request.dataset_id)
 
             # 5b. Check if the dataset already exists on arro-server
-            meta = await arro_client.dataset_metadata()
+            meta = await arro_client.dataset_metadata(dataset_id=request.dataset_id)
             is_new = meta is None
 
             # 5c. Initialise an upload slot on arro-server.
             # upload_init validates dataset_id + root and registers the slot.
             # If arro_server_upload_path is set, we override the returned path
             # (shared-volume deployments) but still call upload_init to register.
-            server_upload_path = await arro_client.upload_init()
+            server_upload_path = await arro_client.upload_init(
+                dataset_id=request.dataset_id, root_label=root_label
+            )
             upload_path = settings.arro_server_upload_path or server_upload_path
 
             # 5d. Write the full embedding matrix as a Zarr v3 array
@@ -169,14 +186,21 @@ async def ingest(
             arr[:] = all_vectors
 
             # 5e. Commit the upload
-            commit_result = await arro_client.upload_commit(upload_path)
+            commit_result = await arro_client.upload_commit(
+                dataset_id=request.dataset_id, fs_path=upload_path
+            )
 
             # 5f. Rebuild index if stale or new dataset
             if commit_result.index_stale or is_new:
-                await arro_client.build_index()
+                await arro_client.build_index(dataset_id=request.dataset_id)
 
         except ArroServerError as exc:
-            logger.error("[ingest] arro-server sync failed at start_row=%d: %s", start_row, exc)
+            logger.error(
+                "[ingest] arro-server sync failed dataset=%s start_row=%d: %s",
+                request.dataset_id,
+                start_row,
+                exc,
+            )
             raise HTTPException(
                 status_code=502,
                 detail=f"arro-server error: {exc}",
@@ -184,8 +208,9 @@ async def ingest(
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     logger.info(
-        "[ingest] ingested %d docs start_row=%d elapsed=%dms",
+        "[ingest] ingested %d docs dataset=%s start_row=%d elapsed=%dms",
         len(documents),
+        request.dataset_id,
         start_row,
         elapsed_ms,
     )

@@ -45,17 +45,25 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Two statements — must be executed with executescript(), not execute().
+_SCHEMA_VERSION = 2
+
 _DDL = """
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS documents (
-    row_index   INTEGER PRIMARY KEY,
-    doc_id      TEXT    NOT NULL UNIQUE,
+    dataset_id  TEXT    NOT NULL,
+    row_index   INTEGER NOT NULL,
+    doc_id      TEXT    NOT NULL,
     text        TEXT    NOT NULL,
     vector      BLOB    NOT NULL,
     metadata    TEXT    NOT NULL DEFAULT '{}',
-    ingested_at TEXT    NOT NULL
+    ingested_at TEXT    NOT NULL,
+    PRIMARY KEY (dataset_id, row_index),
+    UNIQUE      (dataset_id, doc_id)
 );
-CREATE INDEX IF NOT EXISTS idx_doc_id ON documents(doc_id);
+CREATE INDEX IF NOT EXISTS idx_dataset_doc_id ON documents(dataset_id, doc_id);
 """
 
 
@@ -106,8 +114,8 @@ class DocumentStore:
         self._open()
 
     def _open(self) -> None:
-        """Open the connection, create parent dirs, and apply the schema."""
-        if self._conn is not None:  # pragma: no cover
+        """Open the connection, create parent dirs, apply schema, run migrations."""
+        if self._conn is not None:
             return
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -116,13 +124,55 @@ class DocumentStore:
             raise FileNotFoundError(f"db_path is a directory, not a file: {self.db_path}")
 
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        # executescript() handles multi-statement DDL; execute() does not.
-        self._conn.executescript(_DDL)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.commit()
+        self._apply_schema()
+
+    def _apply_schema(self) -> None:
+        """Apply DDL and run any pending migrations."""
+        assert self._conn is not None
+
+        has_sv = (
+            self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+            ).fetchone()
+            is not None
+        )
+
+        if not has_sv:
+            has_docs = (
+                self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='documents'"
+                ).fetchone()
+                is not None
+            )
+            if has_docs:
+                raise RuntimeError(
+                    "Detected a version-1 DocumentStore schema (no dataset_id column). "
+                    "Run: python -m arro_nlp_frontend.migrate --db-path <path> "
+                    "--dataset-id <id> to migrate your existing data before starting "
+                    "the server."
+                )
+
+        self._conn.executescript(_DDL)
+        self._conn.commit()
+
+        cursor = self._conn.execute("SELECT version FROM schema_version LIMIT 1")
+        row = cursor.fetchone()
+        if row is None:
+            self._conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?)", (_SCHEMA_VERSION,)
+            )
+            self._conn.commit()
+        elif int(row[0]) < _SCHEMA_VERSION:
+            raise RuntimeError(
+                f"DocumentStore schema version {row[0]} is older than required "
+                f"{_SCHEMA_VERSION}. Run the migration script."
+            )
 
     def upsert_batch(
         self,
+        dataset_id: str,
         start_row: int,
         docs: list[Document],
         vectors: np.ndarray,
@@ -135,9 +185,10 @@ class DocumentStore:
 
         Parameters
         ----------
-        start_row: First row index to assign. Must be >= 0.
-        docs:      Non-empty list of Document objects.
-        vectors:   Float64 array of shape (N, dim). Must match len(docs).
+        dataset_id: Dataset identifier (e.g. "cve/embeddings").
+        start_row:  First row index to assign. Must be >= 0.
+        docs:       Non-empty list of Document objects.
+        vectors:    Float64 array of shape (N, dim). Must match len(docs).
 
         Returns
         -------
@@ -149,72 +200,73 @@ class DocumentStore:
         """
         if not docs:
             raise ValueError("docs cannot be empty")
-        if start_row < 0:  # pragma: no cover
+        if start_row < 0:
             raise ValueError("start_row must be >= 0")
         if len(docs) != vectors.shape[0]:
             raise ValueError(f"vectors shape {vectors.shape} does not match doc count {len(docs)}")
 
-        # ingested_at is always set server-side; caller-supplied value is ignored.
         now = datetime.now(UTC).isoformat()
         batch_data = [
             (
+                dataset_id,
                 start_row + i,
                 doc.doc_id,
                 doc.text,
                 vectors[i].tobytes(),
-                json.dumps(doc.metadata),  # plain str, not Binary
+                json.dumps(doc.metadata),
                 now,
             )
             for i, doc in enumerate(docs)
         ]
 
-        # Determine created vs updated before the INSERT.
         statuses: list[Literal["created", "updated"]] = []
         for doc in docs:
-            statuses.append("updated" if self.get_by_id(doc.doc_id) else "created")
+            statuses.append("updated" if self.get_by_id(dataset_id, doc.doc_id) else "created")
 
         assert self._conn is not None
         with self._conn:
             self._conn.executemany(
                 """
                 INSERT OR REPLACE INTO documents
-                    (row_index, doc_id, text, vector, metadata, ingested_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (dataset_id, row_index, doc_id, text, vector, metadata, ingested_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 batch_data,
             )
 
         logger.info(
-            "[store] upserted %d documents starting at row_index=%d",
+            "[store] upserted %d documents dataset=%s start_row=%d",
             len(docs),
+            dataset_id,
             start_row,
         )
 
         return statuses
 
-    def get_by_row(self, row_index: int) -> Document | None:
-        """Return the document at row_index, or None if not found."""
+    def get_by_row(self, dataset_id: str, row_index: int) -> Document | None:
+        """Return the document at row_index for the given dataset, or None if not found."""
         assert self._conn is not None
         cursor = self._conn.execute(
             "SELECT row_index, doc_id, text, metadata, ingested_at"
-            " FROM documents WHERE row_index = ?",
-            (row_index,),
+            " FROM documents WHERE dataset_id = ? AND row_index = ?",
+            (dataset_id, row_index),
         )
         row = cursor.fetchone()
         return self._row_to_document(row) if row else None
 
-    def get_by_id(self, doc_id: str) -> Document | None:
-        """Return the document with the given doc_id, or None if not found."""
+    def get_by_id(self, dataset_id: str, doc_id: str) -> Document | None:
+        """Return the document with the given doc_id for the dataset, or None if not found."""
         assert self._conn is not None
         cursor = self._conn.execute(
-            "SELECT row_index, doc_id, text, metadata, ingested_at FROM documents WHERE doc_id = ?",
-            (doc_id,),
+            "SELECT row_index, doc_id, text, metadata, ingested_at"
+            " FROM documents WHERE dataset_id = ? AND doc_id = ?",
+            (dataset_id, doc_id),
         )
         row = cursor.fetchone()
         return self._row_to_document(row) if row else None
 
-    def delete_by_id(self, doc_id: str) -> bool:
-        """Delete the document with doc_id from the store.
+    def delete_by_id(self, dataset_id: str, doc_id: str) -> bool:
+        """Delete the document with doc_id from the given dataset.
 
         Note: This is a SOFT DELETE at the retrieval layer. The corresponding
         vector row in arro-server is NOT removed (Zarr arrays do not support
@@ -225,37 +277,54 @@ class DocumentStore:
         Returns True if a row was deleted, False if doc_id was not found.
         """
         assert self._conn is not None
-        cursor = self._conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+        cursor = self._conn.execute(
+            "DELETE FROM documents WHERE dataset_id = ? AND doc_id = ?",
+            (dataset_id, doc_id),
+        )
         self._conn.commit()
         return cursor.rowcount > 0
 
-    def next_row_index(self) -> int:
-        """Return the next available row index as MAX(row_index) + 1.
+    def next_row_index(self, dataset_id: str) -> int:
+        """Return the next available row index as MAX(row_index) + 1 for the dataset.
 
         Uses MAX() rather than COUNT() to be safe against soft-deleted rows:
         if rows 0, 1, 2 exist and row 1 is deleted, COUNT()=2 but the next
         valid index is 3, not 2. Using COUNT() would silently overwrite row 2.
 
-        Returns 0 if the store is empty.
+        Returns 0 if the dataset has no rows.
         """
         assert self._conn is not None
-        cursor = self._conn.execute("SELECT COALESCE(MAX(row_index) + 1, 0) FROM documents")
+        cursor = self._conn.execute(
+            "SELECT COALESCE(MAX(row_index) + 1, 0) FROM documents WHERE dataset_id = ?",
+            (dataset_id,),
+        )
         return int(cursor.fetchone()[0])
 
-    def count(self) -> int:
-        """Return the total number of documents currently in the store."""
+    def count(self, dataset_id: str | None = None) -> int:
+        """Return the total number of documents.
+
+        If dataset_id is None, returns the count across all datasets.
+        """
         assert self._conn is not None
-        cursor = self._conn.execute("SELECT COUNT(*) FROM documents")
+        if dataset_id is None:
+            cursor = self._conn.execute("SELECT COUNT(*) FROM documents")
+        else:
+            cursor = self._conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE dataset_id = ?", (dataset_id,)
+            )
         return int(cursor.fetchone()[0])
 
-    def get_all_vectors(self) -> np.ndarray:
-        """Return all vectors as a (N, dim) float64 array ordered by row_index.
+    def get_all_vectors(self, dataset_id: str) -> np.ndarray:
+        """Return all vectors for a dataset as a (N, dim) float64 array ordered by row_index.
 
         Used to reconstruct the full Zarr dataset for upload to arro-server.
-        Returns empty array of shape (0,) if store is empty.
+        Returns empty array of shape (0,) if the dataset has no rows.
         """
         assert self._conn is not None
-        cursor = self._conn.execute("SELECT vector FROM documents ORDER BY row_index")
+        cursor = self._conn.execute(
+            "SELECT vector FROM documents WHERE dataset_id = ? ORDER BY row_index",
+            (dataset_id,),
+        )
         rows = cursor.fetchall()
         if not rows:
             return np.array([], dtype=np.float64)

@@ -28,6 +28,8 @@ from arro_nlp_frontend.embedder import Embedder
 from arro_nlp_frontend.main import create_app
 from arro_nlp_frontend.store import DocumentStore
 
+DEFAULT_DS = "test/dataset"
+
 
 @asynccontextmanager
 async def _noop_lifespan(app):
@@ -60,7 +62,10 @@ def store(tmp_path: Path) -> Generator[DocumentStore, None, None]:
 
 @pytest.fixture
 def mock_arro_client() -> AsyncMock:
-    """AsyncMock with new ArroClient methods pre-configured."""
+    """AsyncMock with new ArroClient methods pre-configured.
+
+    All methods now accept dataset_id as the first positional argument.
+    """
     client = AsyncMock(spec=ArroClient)
     client.dataset_metadata = AsyncMock(return_value=None)
     client.upload_init = AsyncMock(return_value="/tmp/arro_test_upload.zarr")

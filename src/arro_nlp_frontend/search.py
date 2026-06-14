@@ -34,6 +34,11 @@ router = APIRouter()
 class SearchRequest(BaseModel):
     """Request body for POST /search."""
 
+    dataset_id: str = Field(
+        ...,
+        min_length=1,
+        description="arro-server dataset to search against, e.g. 'cve/embeddings'.",
+    )
     query: str = Field(..., description="Text query to search for.")
     top_k: int = Field(10, ge=1, le=1000, description="Maximum results to return.")
     tau: float | None = Field(
@@ -107,7 +112,12 @@ async def search(
 
     # Step 4 -- call arro-server
     try:
-        hits = await arro_client.search(vector=vector, top_k=request.top_k, tau=tau)
+        hits = await arro_client.search(
+            dataset_id=request.dataset_id,
+            vector=vector,
+            top_k=request.top_k,
+            tau=tau,
+        )
     except ArroServerError as exc:
         logger.error("[search] arro-server search failed: %s", exc)
         raise HTTPException(
@@ -118,7 +128,7 @@ async def search(
     # Step 5 -- hydrate from store
     results: list[SearchResult] = []
     for hit in hits:
-        doc = store.get_by_row(hit.index)
+        doc = store.get_by_row(dataset_id=request.dataset_id, row_index=hit.index)
         if doc is None:
             logger.warning(
                 "[search] row_index=%d returned by arro-server not found in store "
@@ -139,7 +149,8 @@ async def search(
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     logger.info(
-        "[search] query=%r top_k=%d tau=%.2f hits=%d hydrated=%d duration_ms=%d",
+        "[search] dataset=%s query=%r top_k=%d tau=%.2f hits=%d hydrated=%d duration_ms=%d",
+        request.dataset_id,
         request.query[:60],
         request.top_k,
         tau,

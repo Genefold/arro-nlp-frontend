@@ -19,6 +19,12 @@ Tests
 15. Metadata round-trips correctly
 16. build_index called when index_stale=True
 17. build_index called for new dataset (metadata returns None)
+18. Two datasets have independent row indices
+19. root_label override forwarded to upload_init
+20. root_label defaults to settings.arro_server_root_label
+21. Missing dataset_id yields 422
+22. Different datasets do not block each other
+23. Same dataset requests still serialised
 """
 
 from __future__ import annotations
@@ -36,14 +42,19 @@ from arro_nlp_frontend.embedder import Embedder
 from arro_nlp_frontend.main import create_app
 from arro_nlp_frontend.store import DocumentStore
 
+DEFAULT_DS = "test/dataset"
+
 
 @asynccontextmanager
 async def _noop_lifespan(app):
     yield
 
 
-def _post(client, docs):
-    return client.post("/ingest", json={"documents": docs})
+def _post(client, docs, dataset_id: str = DEFAULT_DS, root_label: str = ""):
+    body = {"dataset_id": dataset_id, "documents": docs}
+    if root_label:
+        body["root_label"] = root_label
+    return client.post("/ingest", json=body)
 
 
 def _zarr_mock() -> tuple[MagicMock, list[np.ndarray]]:
@@ -56,9 +67,6 @@ def _zarr_mock() -> tuple[MagicMock, list[np.ndarray]]:
     mock_arr.__setitem__ = lambda self, key, value: written.append(value)  # type: ignore[method-assign]
     mock_open = MagicMock(return_value=mock_arr)
     return mock_open, written
-
-
-DEFAULT_DS = "default"
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +110,7 @@ def test_ingest_status_created_vs_updated(ingest_client):
 def test_ingest_persists_in_store(ingest_client):
     client, store, _ = ingest_client
     _post(client, [{"doc_id": "doc0", "text": "hello"}])
-    doc = store.get_by_id("doc0")
+    doc = store.get_by_id(DEFAULT_DS, "doc0")
     assert doc is not None
     assert doc.text == "hello"
 
@@ -111,7 +119,7 @@ def test_ingest_vectors_stored_in_sqlite(ingest_client):
     """Vectors are persisted in SQLite and readable via get_all_vectors."""
     client, store, _ = ingest_client
     _post(client, [{"doc_id": "doc0", "text": "hello"}])
-    all_v = store.get_all_vectors()
+    all_v = store.get_all_vectors(DEFAULT_DS)
     assert all_v.shape[0] == 1
     assert all_v.dtype == np.float64
 
@@ -124,11 +132,10 @@ def test_ingest_arro_sync_called(ingest_client):
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         _post(client, [{"doc_id": "doc0", "text": "hello"}])
 
-    mock_arro.dataset_metadata.assert_called_once()
-    mock_arro.upload_init.assert_called_once()
+    mock_arro.dataset_metadata.assert_called_once_with(dataset_id=DEFAULT_DS)
+    mock_arro.upload_init.assert_called_once_with(dataset_id=DEFAULT_DS, root_label="main")
     mock_arro.upload_commit.assert_called_once()
-    mock_arro.build_index.assert_not_called()  # not new, index_stale=False
-    # Zarr was actually written with real vectors
+    mock_arro.build_index.assert_not_called()
     assert len(written) == 1
     assert written[0].shape[0] == 1
     assert written[0].dtype == np.float64
@@ -149,7 +156,7 @@ def test_ingest_metadata_stored(ingest_client):
     meta = {"source": "web", "priority": 5, "notes": ["never"], "empty": {}}
     r = _post(client, [{"doc_id": "docX", "text": "hello", "metadata": meta}])
     assert r.status_code == 200
-    doc = store.get_by_id("docX")
+    doc = store.get_by_id(DEFAULT_DS, "docX")
     assert doc is not None
     assert doc.metadata == meta
 
@@ -193,7 +200,7 @@ def test_ingest_start_row_uses_max_not_count(ingest_client):
             {"doc_id": "doc2", "text": "text2"},
         ],
     )
-    store.delete_by_id("doc1")  # ghost row at index 1
+    store.delete_by_id(DEFAULT_DS, "doc1")  # ghost row at index 1
     r = _post(client, [{"doc_id": "doc3", "text": "text3"}])
     assert r.status_code == 200
     assert r.json()["results"][0]["row_index"] == 3
@@ -228,7 +235,10 @@ def test_ingest_concurrent_batches_no_row_overlap(tmp_path: Path) -> None:
             with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open_zarr):
                 r = await c.post(
                     "/ingest",
-                    json={"documents": [{"doc_id": doc_id, "text": "text"}]},
+                    json={
+                        "dataset_id": DEFAULT_DS,
+                        "documents": [{"doc_id": doc_id, "text": "text"}],
+                    },
                 )
             assert r.status_code == 200, f"Unexpected {r.status_code}: {r.text}"
             return [x["row_index"] for x in r.json()["results"]]
@@ -265,7 +275,7 @@ def test_ingest_duplicate_doc_ids_in_request_422(ingest_client):
 
 def test_ingest_empty_list_422(ingest_client):
     client, _, _ = ingest_client
-    r = client.post("/ingest", json={"documents": []})
+    r = client.post("/ingest", json={"dataset_id": DEFAULT_DS, "documents": []})
     assert r.status_code == 422
 
 
@@ -277,28 +287,25 @@ def test_ingest_arro_server_502_returns_error(ingest_client):
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         r = _post(client, [{"doc_id": "doc0", "text": "hello"}])
     assert r.status_code == 502
-    # Store IS written before sync attempt (new design contract)
-    assert store.count() == 1
-    assert store.get_by_id("doc0") is not None
+    assert store.count(DEFAULT_DS) == 1
+    assert store.get_by_id(DEFAULT_DS, "doc0") is not None
 
 
 def test_ingest_arro_server_502_leaves_previous_intact(ingest_client):
     """A failed sync after a successful one leaves all local docs intact."""
     client, store, mock_arro = ingest_client
-    # First ingest succeeds
     mock_open, _ = _zarr_mock()
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         _post(client, [{"doc_id": "doc0", "text": "hello"}])
-    assert store.count() == 1
-    # Second ingest fails during sync (store write succeeds first)
+    assert store.count(DEFAULT_DS) == 1
     mock_arro.dataset_metadata.side_effect = ArroServerError("mocked failure")
     mock_open2, _ = _zarr_mock()
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open2):
         r = _post(client, [{"doc_id": "doc1", "text": "world"}])
     assert r.status_code == 502
-    assert store.count() == 2  # both docs written locally
-    assert store.get_by_id("doc0") is not None
-    assert store.get_by_id("doc1") is not None
+    assert store.count(DEFAULT_DS) == 2
+    assert store.get_by_id(DEFAULT_DS, "doc0") is not None
+    assert store.get_by_id(DEFAULT_DS, "doc1") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +322,7 @@ def test_ingest_build_index_when_stale(ingest_client):
     mock_open, _ = _zarr_mock()
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         _post(client, [{"doc_id": "doc0", "text": "hello"}])
-    mock_arro.build_index.assert_called_once()
+    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS)
 
 
 def test_ingest_build_index_when_new_dataset(ingest_client):
@@ -325,7 +332,7 @@ def test_ingest_build_index_when_new_dataset(ingest_client):
     mock_open, _ = _zarr_mock()
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         _post(client, [{"doc_id": "doc0", "text": "hello"}])
-    mock_arro.build_index.assert_called_once()
+    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS)
 
 
 # ---------------------------------------------------------------------------
@@ -341,13 +348,72 @@ def test_ingest_zarr_array_written_with_correct_vectors(ingest_client):
         _post(client, [{"doc_id": "doc0", "text": "hello"}])
     assert len(written) == 1
     assert isinstance(written[0], np.ndarray)
-    assert written[0].shape[0] == 1  # one doc
+    assert written[0].shape[0] == 1
     assert written[0].dtype == np.float64
 
 
 # ---------------------------------------------------------------------------
 # Multi-dataset tests
 # ---------------------------------------------------------------------------
+
+
+def test_ingest_two_datasets_independent_row_indices(ingest_client):
+    """Each dataset has its own independent row_index counter."""
+    client, store, mock_arro = ingest_client
+    mock_arro.dataset_metadata = AsyncMock(return_value={"shape": [0, 384]})
+    mock_open, _ = _zarr_mock()
+
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        r_a = _post(client, [{"doc_id": "doc0", "text": "a"}], dataset_id="ds/a")
+    assert r_a.status_code == 200
+    assert r_a.json()["results"][0]["row_index"] == 0
+
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        r_b = _post(client, [{"doc_id": "doc1", "text": "b"}], dataset_id="ds/b")
+    assert r_b.status_code == 200
+    assert r_b.json()["results"][0]["row_index"] == 0
+
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        r_a2 = _post(client, [{"doc_id": "doc2", "text": "a2"}], dataset_id="ds/a")
+    assert r_a2.status_code == 200
+    assert r_a2.json()["results"][0]["row_index"] == 1
+
+    assert store.get_by_id("ds/a", "doc0").row_index == 0  # type: ignore[union-attr]
+    assert store.get_by_id("ds/b", "doc1").row_index == 0  # type: ignore[union-attr]
+    assert store.get_by_id("ds/a", "doc2").row_index == 1  # type: ignore[union-attr]
+
+
+def test_ingest_root_label_override_forwarded(ingest_client):
+    """root_label='staging' is forwarded to upload_init."""
+    client, _, mock_arro = ingest_client
+    mock_arro.dataset_metadata = AsyncMock(return_value={"shape": [0, 384]})
+    mock_open, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        _post(client, [{"doc_id": "doc0", "text": "hello"}], root_label="staging")
+
+    mock_arro.upload_init.assert_called_once_with(dataset_id=DEFAULT_DS, root_label="staging")
+
+
+def test_ingest_root_label_defaults_to_settings(ingest_client):
+    """Omitting root_label uses settings.arro_server_root_label."""
+    from arro_nlp_frontend.config import settings
+
+    client, _, mock_arro = ingest_client
+    mock_arro.dataset_metadata = AsyncMock(return_value={"shape": [0, 384]})
+    mock_open, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        _post(client, [{"doc_id": "doc0", "text": "hello"}])
+
+    mock_arro.upload_init.assert_called_once_with(
+        dataset_id=DEFAULT_DS, root_label=settings.arro_server_root_label
+    )
+
+
+def test_ingest_missing_dataset_id_422(ingest_client):
+    """Request without dataset_id returns 422."""
+    client, _, _ = ingest_client
+    r = client.post("/ingest", json={"documents": [{"doc_id": "d", "text": "t"}]})
+    assert r.status_code == 422
 
 
 def test_ingest_concurrent_batches_different_datasets_do_not_block(
@@ -357,9 +423,9 @@ def test_ingest_concurrent_batches_different_datasets_do_not_block(
 
     With a global lock they would serialise; with per-dataset locks they do not.
     We verify correctness only (no timing assertion — fragile in CI):
-      - Both requests succeed (200)
-      - Row indices are unique — no collision
-      - No exception from concurrent store access
+      - ds/a gets row_index=0
+      - ds/b gets row_index=0  (independent counter)
+      - No collision, no exception.
     """
     with patch("arro_nlp_frontend.main.lifespan", _noop_lifespan):
         app = create_app()
@@ -396,11 +462,10 @@ def test_ingest_concurrent_batches_different_datasets_do_not_block(
             _post_ds("ds/a", "doc-a"),
             _post_ds("ds/b", "doc-b"),
         )
-        # Both succeed and get unique indices (store is shared, so counters
-        # are not truly independent until the store becomes dataset-aware).
-        assert idx_a != idx_b, "Row index collision between datasets"
-        assert idx_a >= 0
-        assert idx_b >= 0
+        # Each dataset has an independent row_index counter, so both
+        # requests see 0 as their first available index.
+        assert idx_a == 0, f"ds/a got row {idx_a}, expected 0"
+        assert idx_b == 0, f"ds/b got row {idx_b}, expected 0"
 
     asyncio.run(_run())
 
