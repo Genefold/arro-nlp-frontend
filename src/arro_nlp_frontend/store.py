@@ -132,6 +132,8 @@ class DocumentStore:
         """Apply DDL and run any pending migrations."""
         assert self._conn is not None
 
+        # Detect old v1 schema (no schema_version table, but documents exists)
+        # before running DDL to avoid CREATE INDEX referencing missing columns.
         has_sv = (
             self._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
