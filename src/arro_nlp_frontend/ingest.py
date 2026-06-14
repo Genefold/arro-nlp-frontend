@@ -6,6 +6,7 @@ Pipeline: validate -> embed (chunked) -> lock -> next_row_index -> persist ->
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Literal
@@ -35,6 +36,9 @@ class IngestItem(BaseModel):
 
 
 class IngestRequest(BaseModel):
+    dataset_id: str = Field(
+        default="default", description="Dataset namespace for per-dataset locking"
+    )
     documents: list[IngestItem] = Field(..., min_length=1)
 
 
@@ -48,6 +52,19 @@ class IngestResponse(BaseModel):
     ingested: int
     results: list[IngestResult]
     duration_ms: int
+
+
+def _get_dataset_lock(locks: dict[str, asyncio.Lock], dataset_id: str) -> asyncio.Lock:
+    """Return the asyncio.Lock for *dataset_id*, creating it lazily if absent.
+
+    Thread-safety note: this function must only be called from within the
+    asyncio event loop (single-threaded). Dict mutation here is safe because
+    asyncio is cooperative: no two coroutines can reach this point concurrently
+    for the same dataset_id without one of them already holding the lock.
+    """
+    if dataset_id not in locks:
+        locks[dataset_id] = asyncio.Lock()
+    return locks[dataset_id]
 
 
 @router.post("/ingest", response_model=IngestResponse, status_code=200)
@@ -67,6 +84,7 @@ async def ingest(
     Pipeline:
       1. Validate: non-empty list, no duplicate doc_ids within the batch
       2. Embed texts in chunks of EMBED_CHUNK -> float64 array (N, dim)
+      2a. (inside lock) — per-dataset lock acquired via `_get_dataset_lock`
       3. (inside lock) start_row = store.next_row_index()
       4. (inside lock) upsert_batch into SQLite with vectors
       5. (inside lock) Sync to arro-server:
@@ -108,7 +126,8 @@ async def ingest(
     vectors = np.vstack(parts) if len(parts) > 1 else parts[0]
 
     # Steps 3-5 — inside the lock: start_row is stable for the duration
-    async with req.app.state.ingest_lock:
+    lock = _get_dataset_lock(req.app.state.ingest_locks, request.dataset_id)
+    async with lock:
         start_row = store.next_row_index()
 
         documents = [

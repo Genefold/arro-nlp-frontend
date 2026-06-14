@@ -218,3 +218,99 @@ These are not optimisations — they fix silent data corruption:
 2. **Multi-worker safety**: replace `asyncio.Lock` with SQLite `BEGIN EXCLUSIVE` (same-host multi-worker) or an external queue (ARQ + Redis for multi-host).
 3. **Search LRU cache**: cache (query_hash, top_k, tau) → results with configurable TTL.
 4. **Arrow IPC vector transport**: replace JSON serialisation with Arrow IPC for ingest and search payloads.
+
+
+
+7 open issues. Here is the ordered implementation checklist with the dependency graph made explicit.
+
+***
+
+## Implementation Checklist — `arro-nlp-frontend`
+
+### 🔴 Step 1 — Merge PR #18 first (prerequisite for everything below)
+
+Issue (https://github.com/Genefold/arro-nlp-frontend/issues/17) is already implemented in PR #18, currently waiting on reviewer approval . Nothing below can be started cleanly until `feat/multidataset-serving` is on `main`.
+
+***
+
+### 🟠 Step 2 — Issue (https://github.com/Genefold/arro-nlp-frontend/issues/19) · Per-dataset ingest lock
+**Depends on:** PR #18 merged  
+**Effort:** ~15 lines of code, spec fully written in the issue
+
+- [ ] Change `app.state.ingest_lock: asyncio.Lock` → `app.state.ingest_locks: dict[str, asyncio.Lock]` in `main.py`
+- [ ] Add `_get_dataset_lock(locks, dataset_id)` helper in `ingest.py`
+- [ ] Replace `async with req.app.state.ingest_lock` with `async with lock` using the helper
+- [ ] Update `conftest.py` fixtures: inject `ingest_locks = {}` instead of `ingest_lock`
+- [ ] Add `test_ingest_concurrent_batches_different_datasets_do_not_block`
+- [ ] Add `test_ingest_concurrent_batches_same_dataset_still_serialised`
+- [ ] Remove `LOCK IS GLOBAL ACROSS ALL DATASETS` block from docstring; keep `SINGLE-PROCESS GUARANTEE ONLY` block
+
+***
+
+### 🟡 Step 3 — Issue (https://github.com/Genefold/arro-nlp-frontend/issues/8) · `GET/DELETE /documents/{doc_id}`
+**Depends on:** PR #18 merged (needs `dataset_id` in all store calls)  
+**Effort:** new router file + 6 tests
+
+- [ ] Create `src/arro_nlp_frontend/router/documents.py`
+- [ ] Implement `GET /documents/{doc_id}` → `DocumentResponse` (200) or 404
+- [ ] Implement `DELETE /documents/{doc_id}` → `DeleteResponse` (200) or 404
+- [ ] Add `DocumentResponse` and `DeleteResponse` to `models.py`
+- [ ] Register the documents router in `main.py`
+- [ ] Write `tests/test_documents.py` (6 tests: get existing, get missing, delete existing, delete missing, delete-then-get, delete doesn't affect others)
+- [ ] Document in the DELETE docstring: soft-delete only, vector stays in arro-server Zarr
+
+***
+
+### 🟡 Step 4 — Issue (https://github.com/Genefold/arro-nlp-frontend/issues/12) · Re-ingest ghost vector bug
+**Depends on:** Issue #8 (`DELETE` endpoint) so callers have a path to remove before re-ingesting  
+**Effort:** 1 guard in `ingest.py` + 1 test
+
+- [ ] In `ingest.py`, before computing `next_row_index`, check if any `doc_id` in the batch already exists in the store
+- [ ] Return `409 Conflict` if a duplicate `doc_id` is found (body: which IDs conflict)
+- [ ] Add `test_ingest_existing_doc_id_returns_409`
+- [ ] Update docstring: re-ingest forbidden, callers must `DELETE` first
+
+***
+
+### 🔵 Step 5 — Issue (https://github.com/Genefold/arro-nlp-frontend/issues/15) · Typed `app.state`
+**Depends on:** nothing — but best done after steps 2–4 so the final shape of `AppState` is stable  
+**Effort:** 1 new file + minor edits to 2 files
+
+- [ ] Create `src/arro_nlp_frontend/state.py` with `AppState` dataclass and `get_state(req)` accessor
+- [ ] Update `AppState` field `ingest_lock` → `ingest_locks: dict[str, asyncio.Lock]` (from step 2)
+- [ ] Update `main.py` lifespan to set `app.state._app_state = AppState(...)`
+- [ ] Update `ingest.py` (and any future endpoint) to call `get_state(req)` instead of `req.app.state.*`
+- [ ] Verify `mypy src/` passes with no `attr-defined` errors
+
+***
+
+### 🔵 Step 6 — Issue (https://github.com/Genefold/arro-nlp-frontend/issues/13) · Multi-worker safety
+**Depends on:** nothing blocking, but low urgency  
+**Effort:** documentation + 1 startup warning, no code logic change yet
+
+- [ ] Add prominent `⚠️ WORKERS=1 ONLY` warning to `README.md` and startup logs
+- [ ] In `lifespan()`, log a `WARNING` if the process detects it may not be the only worker (best-effort)
+- [ ] Document the `BEGIN EXCLUSIVE` path as the eventual fix in the issue/comments
+
+***
+
+### ⚪ Step 7 — Issue (https://github.com/Genefold/arro-nlp-frontend/issues/14) · Binary vector transport
+**Depends on:** nothing, but requires arro-server API alignment first  
+**Effort:** `ArroClient` transport change only, isolated behind the existing abstraction boundary
+
+- [ ] Short term: add `max_batch_size: int = Field(200, le=500)` to `IngestRequest`
+- [ ] Long term (when arro-server supports it): replace `vectors.tolist()` + JSON with Arrow IPC in `ArroClient.push_vectors()`
+
+***
+
+## Dependency order at a glance
+
+```
+PR #18 merge
+    └── #19  (per-dataset lock)          ← do immediately after merge
+    └── #8   (GET/DELETE documents)      ← do immediately after merge
+         └── #12 (409 on re-ingest)      ← needs DELETE to exist first
+    └── #15  (typed app.state)           ← after #19 so AppState shape is final
+    └── #13  (multi-worker docs)         ← anytime, low effort
+    └── #14  (binary transport)          ← last, needs arro-server coordination
+```

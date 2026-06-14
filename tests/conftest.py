@@ -15,7 +15,6 @@ manually. This prevents:
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Generator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -88,7 +87,7 @@ def ingest_client(
         app.state.embedder = local_embedder
         app.state.store = store
         app.state.arro_client = mock_arro_client
-        app.state.ingest_lock = asyncio.Lock()
+        app.state.ingest_locks = {}
         with TestClient(app, raise_server_exceptions=True) as client:
             yield client, store, mock_arro_client
 
@@ -109,7 +108,7 @@ def search_client(
         app.state.embedder = local_embedder
         app.state.store = store
         app.state.arro_client = mock_arro_client
-        app.state.ingest_lock = asyncio.Lock()
+        app.state.ingest_locks = {}
         with TestClient(app, raise_server_exceptions=True) as client:
             yield client, store, mock_arro_client
 
@@ -134,6 +133,6 @@ def app_client(local_embedder: Embedder) -> Generator[TestClient, None, None]:
             # gets a real object rather than an AttributeError.
             app.state.store = DocumentStore(Path(tmpdir) / "smoke.sqlite")
             app.state.arro_client = AsyncMock(spec=ArroClient)
-            app.state.ingest_lock = asyncio.Lock()
+            app.state.ingest_locks = {}
             with TestClient(app, raise_server_exceptions=True) as client:
                 yield client

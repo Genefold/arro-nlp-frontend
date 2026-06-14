@@ -132,9 +132,9 @@ def test_search_rank_resequenced_after_ghost_skips(search_client):
     _seed_store(store, [(0, "doc0", "first"), (2, "doc2", "third")])
     mock_arro.search = AsyncMock(
         return_value=[
-            SearchHit(index=0, score=0.9),   # found
-            SearchHit(index=1, score=0.7),   # ghost -- row 1 not in store
-            SearchHit(index=2, score=0.5),   # found
+            SearchHit(index=0, score=0.9),  # found
+            SearchHit(index=1, score=0.7),  # ghost -- row 1 not in store
+            SearchHit(index=2, score=0.5),  # found
         ],
     )
 

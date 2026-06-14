@@ -6,7 +6,7 @@ ingest_lock are initialised once and injected via app.state.
 
 from __future__ import annotations
 
-import asyncio
+import asyncio  # noqa: F401  -- kept for type annotations and future use
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -30,15 +30,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application startup and shutdown.
 
     On startup: initialises Embedder, DocumentStore, ArroClient, and the
-    asyncio.Lock used to serialise ingest operations. Logs embedder config
-    and performs a consistency check between the arro-server dataset shape
+    per-dataset asyncio.Lock registry used to serialise concurrent ingest
+    operations within the same dataset. Logs embedder config and performs
+    a consistency check between the arro-server dataset shape
     and the local document store row count.
 
     On shutdown: closes the ArroClient httpx session and the SQLite connection.
     """
     app.state.embedder = Embedder.from_settings()
     app.state.store = DocumentStore(Path(settings.store_db_path))
-    app.state.ingest_lock = asyncio.Lock()
+    app.state.ingest_locks = {}
     app.state.arro_client = ArroClient(
         base_url=settings.arro_server_url,
         dataset_id=settings.arro_server_dataset_id,
