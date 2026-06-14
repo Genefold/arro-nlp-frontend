@@ -223,6 +223,7 @@ As of PR #20: `dataset_id` is required in the request body. The lock is a per-da
 
 ### Future work
 
+- Implement issue #19: per-dataset lock.
 - Add `max_length=500` (configurable) to `IngestRequest.documents`.
 - Investigate append-only Zarr writes to eliminate O(N) rewrite.
 - Release lock after SQLite write; move Zarr rewrite outside the lock scope.
@@ -276,6 +277,7 @@ Pure read path — no lock. As of PR #18: `dataset_id` is required in the reques
 | [#13](https://github.com/Genefold/arro-nlp-frontend/issues/13) | `asyncio.Lock` does not protect multi-worker or multi-replica | High |
 | [#14](https://github.com/Genefold/arro-nlp-frontend/issues/14) | `vectors.tolist()` + JSON does not scale for large batches | Medium |
 | [#15](https://github.com/Genefold/arro-nlp-frontend/issues/15) | `app.state` untyped, no mypy verification | Low |
+| [#19](https://github.com/Genefold/arro-nlp-frontend/issues/19) | Per-dataset ingest lock (`dict[str, asyncio.Lock]`) | Medium |
 
 ---
 

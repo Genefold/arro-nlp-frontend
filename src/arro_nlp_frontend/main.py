@@ -12,10 +12,11 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 import uvicorn
 from fastapi import FastAPI
 
-from arro_nlp_frontend.arro_client import ArroClient, ArroServerError
+from arro_nlp_frontend.arro_client import ArroClient
 from arro_nlp_frontend.config import settings
 from arro_nlp_frontend.embedder import Embedder
 from arro_nlp_frontend.ingest import router as ingest_router

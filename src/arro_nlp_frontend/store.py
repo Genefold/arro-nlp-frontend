@@ -8,7 +8,7 @@ Design rules (NON NEGOTIABLE):
   - metadata is persisted as a JSON string and deserialised on every read.
   - db_path parent directories are created automatically (mkdir parents=True).
   - Thread-safe: check_same_thread=False with one connection per instance.
-  - Empty upsert_batch raises ValueError — silent no-ops hide bugs.
+  - Empty upsert_batch raises ValueError -- silent no-ops hide bugs.
 
 Row index invariant (NON NEGOTIABLE):
   row_index is the ONLY join key between the vector index (arro-server/Parquet)
@@ -16,7 +16,7 @@ Row index invariant (NON NEGOTIABLE):
 
   1. start_row must be derived inside the same write lock that protects the
      arro-server push. It must NEVER be computed as store.count() before the
-     push — two concurrent callers would compute the same start_row and corrupt
+     push -- two concurrent callers would compute the same start_row and corrupt
      the index. The ingest endpoint (issue #6) owns this lock.
 
   2. row_index is IMMUTABLE after insertion. INSERT OR REPLACE is safe only

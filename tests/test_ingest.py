@@ -23,8 +23,6 @@ Tests
 19. root_label override forwarded to upload_init
 20. root_label defaults to settings.arro_server_root_label
 21. Missing dataset_id yields 422
-22. Different datasets do not block each other
-23. Same dataset requests still serialised
 """
 
 from __future__ import annotations
