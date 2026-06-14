@@ -12,13 +12,13 @@
 | [7](https://github.com/Genefold/arro-nlp-frontend/issues/7) | `POST /search` | ✅ Merged (PR #16) | #4, #5, #6 | #8, webapp |
 | [8](https://github.com/Genefold/arro-nlp-frontend/issues/8) | `GET/DELETE /documents/{doc_id}` | ⏳ Pending | #5, #6 | leaf |
 | [17](https://github.com/Genefold/arro-nlp-frontend/issues/17) | Multi-dataset serving — DocumentStore v2 | ✅ Merged (PR #18) | #6, #7 | cve-search#9 |
-| [19](https://github.com/Genefold/arro-nlp-frontend/issues/19) | Per-dataset ingest lock (`dict[str, asyncio.Lock]`) | 🔄 In review (PR #20) | PR #18 | — |
+| [19](https://github.com/Genefold/arro-nlp-frontend/issues/19) | Per-dataset ingest lock (`dict[str, asyncio.Lock]`) | ✅ Merged (PR #20) | PR #18 | — |
 
 **On [`arro-cve-search`](https://github.com/Genefold/arro-cve-search)**
 
 | # | Title | Status | Depends on |
 |---|---|---|---|
-| [9](https://github.com/Genefold/arro-cve-search/issues/9) | `harness/ingest.py` — CVE HTTP ingest | ⏳ Pending | arro-nlp-frontend PR #18 merged |
+| [9](https://github.com/Genefold/arro-cve-search/issues/9) | `harness/ingest.py` — CVE HTTP ingest | ⏳ Pending | arro-nlp-frontend PR #20 merged |
 
 ---
 
@@ -31,13 +31,7 @@
 - **`POST /ingest`** (`#6` / PR #11): embed → SQLite → Zarr rewrite → arro-server push. Full offline test suite (19 tests).
 - **`POST /search`** (`#7` / PR #16): embed query → arro-server → hydrate from store. Ghost row handling. tau override. 11 tests.
 - **Multi-dataset serving** (PR #18, closes #17): DocumentStore v2, per-call `dataset_id`, `migrate.py`, 19 new tests.
-
-### 🔄 In review
-
-- **Per-dataset ingest lock** (PR #20, closes #19):
-  - Replaces single global `asyncio.Lock` with `dict[str, asyncio.Lock]` keyed by `dataset_id`.
-  - `_get_dataset_lock()` helper in `ingest.py` for lazy, auditable lock creation.
-  - 2 new concurrent tests (tests 22 & 23): cross-dataset parallelism + same-dataset serialisation.
+- **Per-dataset ingest lock** (PR #20, closes #19): `dict[str, asyncio.Lock]` keyed by `dataset_id`, `_get_dataset_lock()` helper, 2 new concurrent tests (cross-dataset parallelism + same-dataset serialisation). Ingest throughput for N datasets is now N-concurrent.
 
 ### ⏳ Pending — this repo
 
@@ -53,11 +47,7 @@
 
 This section lists every gap between the current state of `arro-nlp-frontend` and a working CVE semantic search product. Items are ordered by the sequence in which they must be resolved.
 
-### Gap 1 — PR #20 should be merged (recommended)
-
-Not a hard blocker for CVE search correctness, but merging #20 before writing the ingest harness means the harness benefits from parallel dataset ingestion from day one.
-
-### Gap 2 — `harness/ingest.py` does not exist (or is not updated for v2 API)
+### Gap 1 — `harness/ingest.py` does not exist (or is not updated for v2 API)
 
 The ingest harness needs to:
 - Parse NVD/CVE JSON feed (or CVE List v5 format).
@@ -69,7 +59,7 @@ The ingest harness needs to:
 
 This is `arro-cve-search#9`. It has no implementation yet.
 
-### Gap 3 — No CVE data source is configured
+### Gap 2 — No CVE data source is configured
 
 The harness needs a CVE data source. Options:
 - **NVD REST API v2** (`https://services.nvd.nist.gov/rest/json/cves/2.0`): paginated, rate-limited (50 req/30s without API key, 2000 req/30s with key). Requires an NVD API key env var.
@@ -78,7 +68,7 @@ The harness needs a CVE data source. Options:
 
 No data source has been chosen or documented. This must be decided before the harness is written.
 
-### Gap 4 — No search client / webapp
+### Gap 3 — No search client / webapp
 
 `POST /search` is implemented and tested. Nothing consumes it yet. The CVE search product needs at minimum:
 - A CLI query tool (`arro-cve-search/query.py`): `python query.py "heap overflow in network driver"` → ranked CVE list with scores.
@@ -86,7 +76,7 @@ No data source has been chosen or documented. This must be decided before the ha
 
 This is untracked. Should become `arro-cve-search#10` (or equivalent).
 
-### Gap 5 — `GET/DELETE /documents/{doc_id}` is unimplemented (issue #8)
+### Gap 4 — `GET/DELETE /documents/{doc_id}` is unimplemented (issue #8)
 
 For a CVE search product this matters when:
 - A CVE is rejected/withdrawn from the NVD feed and must be removed from search results.
@@ -94,13 +84,13 @@ For a CVE search product this matters when:
 
 Without `DELETE`, the only option is re-ingest (which updates the embedding but leaves a ghost vector in arro-server — see issue #12). This is a known correctness gap for the re-ingest case.
 
-### Gap 6 — No end-to-end integration test
+### Gap 5 — No end-to-end integration test
 
 All existing tests run fully offline (mocked arro-server). There is no test that spins up a real arro-server instance, ingests CVE documents, and asserts that search returns the correct results. This gap means a silent protocol mismatch between `arro-nlp-frontend` and `arro-server` would not be caught by CI.
 
 A minimal `tests/integration/test_e2e.py` with a Docker Compose fixture (`arro-server` + `arro-nlp-frontend`) is needed before the system goes to production.
 
-### Gap 7 — No deployment configuration
+### Gap 6 — No deployment configuration
 
 There is no `Dockerfile`, `docker-compose.yml`, or `k8s/` manifest for `arro-nlp-frontend`. Running the full stack (`arro-server` + `arro-nlp-frontend` + a mounted Zarr volume) requires manual setup. A `docker-compose.yml` that wires the two services together and sets all required env vars is the minimum needed for a reproducible deployment.
 
@@ -108,18 +98,17 @@ There is no `Dockerfile`, `docker-compose.yml`, or `k8s/` manifest for `arro-nlp
 
 ## Recommended next steps (ordered)
 
-1. **Merge PR #20** (per-dataset lock) — clean, reviewed, CI should go green.
-2. **Implement `arro-cve-search#9`** (CVE ingest harness) using the v2 `/ingest` API with `dataset_id: "cve/embeddings"`. Decide on data source (Gap 3) first.
-3. **Implement issue #8** (`GET/DELETE /documents/{doc_id}`) — needed for CVE withdrawal handling.
-4. **Implement `arro-cve-search#10`** (query CLI or web UI) — makes the product usable.
-5. **Write `docker-compose.yml`** for `arro-server` + `arro-nlp-frontend` — prerequisite for integration testing and deployment.
-6. **Write `tests/integration/test_e2e.py`** — end-to-end smoke test with real arro-server.
+1. **Implement `arro-cve-search#9`** (CVE ingest harness) using the v2 `/ingest` API with `dataset_id: "cve/embeddings"`. Decide on data source (Gap 2) first.
+2. **Implement issue #8** (`GET/DELETE /documents/{doc_id}`) — needed for CVE withdrawal handling.
+3. **Implement `arro-cve-search#10`** (query CLI or web UI) — makes the product usable.
+4. **Write `docker-compose.yml`** for `arro-server` + `arro-nlp-frontend` — prerequisite for integration testing and deployment.
+5. **Write `tests/integration/test_e2e.py`** — end-to-end smoke test with real arro-server.
 
 ---
 
 # Codebase Analysis
 
-*As of PR #20 (open). Every section covers one architectural layer: design rationale, the specific risks introduced by that design, and the correct future path.*
+*As of PR #20 (merged). Every section covers one architectural layer: design rationale, the specific risks introduced by that design, and the correct future path.*
 
 ---
 
@@ -223,7 +212,6 @@ As of PR #20: `dataset_id` is required in the request body. The lock is a per-da
 
 ### Future work
 
-- Implement issue #19: per-dataset lock.
 - Add `max_length=500` (configurable) to `IngestRequest.documents`.
 - Investigate append-only Zarr writes to eliminate O(N) rewrite.
 - Release lock after SQLite write; move Zarr rewrite outside the lock scope.
@@ -277,7 +265,6 @@ Pure read path — no lock. As of PR #18: `dataset_id` is required in the reques
 | [#13](https://github.com/Genefold/arro-nlp-frontend/issues/13) | `asyncio.Lock` does not protect multi-worker or multi-replica | High |
 | [#14](https://github.com/Genefold/arro-nlp-frontend/issues/14) | `vectors.tolist()` + JSON does not scale for large batches | Medium |
 | [#15](https://github.com/Genefold/arro-nlp-frontend/issues/15) | `app.state` untyped, no mypy verification | Low |
-| [#19](https://github.com/Genefold/arro-nlp-frontend/issues/19) | Per-dataset ingest lock (`dict[str, asyncio.Lock]`) | Medium |
 
 ---
 
@@ -285,9 +272,8 @@ Pure read path — no lock. As of PR #18: `dataset_id` is required in the reques
 
 ### Phase 1 — Complete the core feature set (now)
 
-1. Merge PR #20 (per-dataset lock — reviewed, clean).
-2. Implement `arro-cve-search#9`: CVE ingest harness targeting v2 API (`dataset_id: "cve/embeddings"`).
-3. Implement issue #8: `GET/DELETE /documents/{doc_id}`.
+1. Implement `arro-cve-search#9`: CVE ingest harness targeting v2 API (`dataset_id: "cve/embeddings"`).
+2. Implement issue #8: `GET/DELETE /documents/{doc_id}`.
 
 ### Phase 2 — Make it usable as a product
 
@@ -316,4 +302,4 @@ These fix silent data corruption, not features:
 1. Append-only Zarr writes: eliminate O(N) rewrite per ingest; requires arro-server API extension.
 2. Multi-worker safety: `BEGIN EXCLUSIVE` (same-host) or ARQ + Redis queue (multi-host).
 3. Search LRU cache: cache `(query_hash, top_k, tau)` → results with configurable TTL.
-4. Arrow IPC vector transport: replace JSON with Arrow IPC for ingest and search payloads..
+4. Arrow IPC vector transport: replace JSON with Arrow IPC for ingest and search payloads.
