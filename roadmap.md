@@ -316,4 +316,4 @@ These fix silent data corruption, not features:
 1. Append-only Zarr writes: eliminate O(N) rewrite per ingest; requires arro-server API extension.
 2. Multi-worker safety: `BEGIN EXCLUSIVE` (same-host) or ARQ + Redis queue (multi-host).
 3. Search LRU cache: cache `(query_hash, top_k, tau)` → results with configurable TTL.
-4. Arrow IPC vector transport: replace JSON with Arrow IPC for ingest and search payloads.
+4. Arrow IPC vector transport: replace JSON with Arrow IPC for ingest and search payloads..
