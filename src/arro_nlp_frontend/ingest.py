@@ -88,24 +88,17 @@ async def ingest(
     """Ingest documents: embed -> store in SQLite -> Zarr rewrite -> index.
 
     SINGLE-PROCESS GUARANTEE ONLY.
-    The asyncio.Lock prevents row index corruption under concurrent async
-    requests within a single uvicorn worker. It does NOT protect against
-    multiple uvicorn worker processes (--workers N > 1). For multi-worker
-    production deployments, a database-level advisory lock or a serialised
-    ingest queue is required.
+    The per-dataset asyncio.Lock prevents row index corruption under
+    concurrent async requests within a single uvicorn worker. It does NOT
+    protect against multiple uvicorn worker processes (--workers N > 1).
+    For multi-worker production deployments, a database-level advisory lock
+    or a serialised ingest queue is required.
 
-    LOCK IS GLOBAL ACROSS ALL DATASETS.
-    The lock is a single asyncio.Lock shared by all datasets. Two concurrent
-    ingest requests targeting different dataset_ids (e.g. 'ds/a' and 'ds/b')
-    will queue behind the same lock. This is safe and correct: each dataset
-    has an independent row_index counter and an independent Zarr array, so
-    there is no correctness reason for the shared lock -- it is a throughput
-    limitation. Under this design, ingest throughput for N datasets is the
-    same as for 1 dataset: fully serialised.
-
-    If per-dataset parallelism is required in future, replace the single
-    asyncio.Lock with a dict[str, asyncio.Lock] keyed by dataset_id. That
-    change requires its own spec and test coverage before implementation.
+    LOCK IS PER-DATASET.
+    A separate asyncio.Lock is created lazily for each dataset_id via
+    _get_dataset_lock(). Concurrent requests to different datasets run in
+    parallel. Concurrent requests to the same dataset are serialised to
+    protect the row_index counter and the Zarr rewrite.
 
     Pipeline:
       1. Validate: non-empty list, no duplicate doc_ids within the batch
