@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
     app.state.embedder = Embedder.from_settings()
     app.state.store = DocumentStore(Path(settings.store_db_path))
-    app.state.ingest_locks: dict[str, asyncio.Lock] = {}
+    app.state.ingest_locks = {}
     app.state.arro_client = ArroClient(base_url=settings.arro_server_url)
 
     logger.info(
@@ -53,20 +53,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Embedder ready. dim=%d", app.state.embedder.dim)
 
     try:
-        meta = await app.state.arro_client.dataset_metadata(
-            dataset_id=settings.arro_server_dataset_id
+        await app.state.arro_client._client.get("/health", timeout=3.0)
+        logger.info("[startup] arro-server is reachable.")
+    except httpx.RequestError:
+        logger.warning(
+            "[startup] Could not reach arro-server. Search will fail until it is available."
         )
-        arro_rows = meta["shape"][0] if meta is not None else 0
-        store_rows = app.state.store.count(dataset_id=settings.arro_server_dataset_id)
-        if arro_rows != store_rows:
-            logger.warning(
-                "[startup] arro-server has %d rows, store has %d documents. "
-                "If arro-server was rebuilt, the store must be rebuilt too.",
-                arro_rows,
-                store_rows,
-            )
-    except ArroServerError:
-        logger.warning("[startup] Could not reach arro-server for metadata check.")
 
     yield
 
