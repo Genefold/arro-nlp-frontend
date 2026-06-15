@@ -17,9 +17,10 @@ import zarr
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from arro_nlp_frontend.arro_client import ArroServerError, VectorAppendResult
+from arro_nlp_frontend.arro_client import ArroClient, ArroServerError, VectorAppendResult
 from arro_nlp_frontend.config import settings
-from arro_nlp_frontend.store import Document
+from arro_nlp_frontend.embedder import Embedder
+from arro_nlp_frontend.store import Document, DocumentStore
 
 logger = logging.getLogger(__name__)
 
@@ -132,13 +133,13 @@ def _get_dataset_lock(locks: dict[str, asyncio.Lock], dataset_id: str) -> asynci
 
 
 async def _run_incremental_pipeline(
-    request: "IngestRequest",
-    embedder: "Embedder",
-    store: "DocumentStore",
-    arro_client: "ArroClient",
-    locks: "dict[str, asyncio.Lock]",
+    request: IngestRequest,
+    embedder: Embedder,
+    store: DocumentStore,
+    arro_client: ArroClient,
+    locks: dict[str, asyncio.Lock],
     root_label: str,
-) -> "IngestResponse":
+) -> IngestResponse:
     """Execute the incremental ingest pipeline.
 
     Classification
@@ -191,9 +192,9 @@ async def _run_incremental_pipeline(
     # Step 1 -- Classify documents
     # ------------------------------------------------------------------
     # Three buckets. Each item is (IngestItem, existing_row_index_or_None).
-    new_items:      list[IngestItem] = []
-    changed_items:  list[tuple[IngestItem, int]] = []   # (item, existing_row_index)
-    metadata_items: list[tuple[IngestItem, int]] = []   # (item, existing_row_index)
+    new_items: list[IngestItem] = []
+    changed_items: list[tuple[IngestItem, int]] = []  # (item, existing_row_index)
+    metadata_items: list[tuple[IngestItem, int]] = []  # (item, existing_row_index)
 
     for item in request.documents:
         existing = store.get_by_id(request.dataset_id, item.doc_id)
@@ -207,26 +208,20 @@ async def _run_incremental_pipeline(
     # ------------------------------------------------------------------
     # Step 2 -- Embed new + changed documents (outside lock)
     # ------------------------------------------------------------------
-    embed_texts: list[str] = (
-        [it.text for it in new_items]
-        + [it.text for it, _ in changed_items]
-    )
+    embed_texts: list[str] = [it.text for it in new_items] + [it.text for it, _ in changed_items]
 
     if embed_texts:
-        chunks = [
-            embed_texts[i : i + EMBED_CHUNK]
-            for i in range(0, len(embed_texts), EMBED_CHUNK)
-        ]
+        chunks = [embed_texts[i : i + EMBED_CHUNK] for i in range(0, len(embed_texts), EMBED_CHUNK)]
         parts = [embedder.encode_batch(chunk) for chunk in chunks]
         all_vecs = np.vstack(parts) if len(parts) > 1 else parts[0]
-        new_vecs     = all_vecs[: len(new_items)]       # shape (N_new, dim)
-        changed_vecs = all_vecs[len(new_items) :]       # shape (N_changed, dim)
+        new_vecs = all_vecs[: len(new_items)]  # shape (N_new, dim)
+        changed_vecs = all_vecs[len(new_items) :]  # shape (N_changed, dim)
     else:
         # All documents are metadata-only -- no embed call needed.
         # new_vecs and changed_vecs are unused in this branch but must be
         # defined to satisfy the variable scope below (no append/overwrite
         # will be called since new_items and changed_items are both empty).
-        new_vecs     = np.empty((0, 0), dtype=np.float64)
+        new_vecs = np.empty((0, 0), dtype=np.float64)
         changed_vecs = np.empty((0, 0), dtype=np.float64)
 
     # ------------------------------------------------------------------
@@ -240,7 +235,7 @@ async def _run_incremental_pipeline(
             # 3a. Consistency guard
             if new_items:
                 server_count = await arro_client.get_vector_count(request.dataset_id)
-                local_count  = store.next_row_index(dataset_id=request.dataset_id)
+                local_count = store.next_row_index(dataset_id=request.dataset_id)
                 if server_count != local_count:
                     raise HTTPException(
                         status_code=409,
@@ -268,9 +263,7 @@ async def _run_incremental_pipeline(
                     )
                     for i, item in enumerate(new_items)
                 ]
-                store.upsert_batch_with_indices(
-                    request.dataset_id, new_docs, new_vecs
-                )
+                store.upsert_batch_with_indices(request.dataset_id, new_docs, new_vecs)
                 results.extend(
                     IngestResult(
                         doc_id=doc.doc_id,
@@ -283,8 +276,7 @@ async def _run_incremental_pipeline(
             # 3c. Overwrite changed vectors
             if changed_items:
                 updates = [
-                    (row_idx, changed_vecs[i])
-                    for i, (_, row_idx) in enumerate(changed_items)
+                    (row_idx, changed_vecs[i]) for i, (_, row_idx) in enumerate(changed_items)
                 ]
                 await arro_client.overwrite_vectors(request.dataset_id, updates)
                 changed_docs = [
@@ -297,9 +289,7 @@ async def _run_incremental_pipeline(
                     )
                     for (item, row_idx) in changed_items
                 ]
-                store.upsert_batch_with_indices(
-                    request.dataset_id, changed_docs, changed_vecs
-                )
+                store.upsert_batch_with_indices(request.dataset_id, changed_docs, changed_vecs)
                 results.extend(
                     IngestResult(
                         doc_id=doc.doc_id,
@@ -324,9 +314,7 @@ async def _run_incremental_pipeline(
                     )
                     for (item, row_idx) in metadata_items
                 ]
-                store.upsert_batch_with_indices(
-                    request.dataset_id, meta_docs, meta_vecs
-                )
+                store.upsert_batch_with_indices(request.dataset_id, meta_docs, meta_vecs)
                 results.extend(
                     IngestResult(
                         doc_id=doc.doc_id,

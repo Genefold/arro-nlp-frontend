@@ -271,10 +271,7 @@ class ArroClient:
             raise ValueError("overwrite_vectors: updates must not be empty")
 
         payload = {
-            "updates": [
-                {"row_index": row_idx, "vector": vec.tolist()}
-                for row_idx, vec in updates
-            ]
+            "updates": [{"row_index": row_idx, "vector": vec.tolist()} for row_idx, vec in updates]
         }
         url = f"/api/datasets/{dataset_id}/vectors/overwrite"
         try:

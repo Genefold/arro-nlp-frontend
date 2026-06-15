@@ -287,9 +287,7 @@ class DocumentStore:
         if not docs:
             raise ValueError("docs cannot be empty")
         if len(docs) != vectors.shape[0]:
-            raise ValueError(
-                f"vectors shape {vectors.shape} does not match doc count {len(docs)}"
-            )
+            raise ValueError(f"vectors shape {vectors.shape} does not match doc count {len(docs)}")
         if any(doc.row_index < 0 for doc in docs):
             raise ValueError("all doc.row_index values must be >= 0")
 
@@ -297,7 +295,7 @@ class DocumentStore:
         batch_data = [
             (
                 dataset_id,
-                doc.row_index,        # pre-assigned, not start_row + i
+                doc.row_index,  # pre-assigned, not start_row + i
                 doc.doc_id,
                 doc.text,
                 vectors[i].tobytes(),
@@ -308,8 +306,7 @@ class DocumentStore:
         ]
 
         statuses: list[Literal["created", "updated"]] = [
-            "updated" if self.get_by_id(dataset_id, doc.doc_id) else "created"
-            for doc in docs
+            "updated" if self.get_by_id(dataset_id, doc.doc_id) else "created" for doc in docs
         ]
 
         assert self._conn is not None
