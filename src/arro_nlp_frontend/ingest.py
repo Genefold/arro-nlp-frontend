@@ -7,6 +7,7 @@ Pipeline: validate -> embed (chunked) -> lock -> next_row_index -> persist ->
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from typing import Literal
@@ -16,9 +17,10 @@ import zarr
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from arro_nlp_frontend.arro_client import ArroServerError
+from arro_nlp_frontend.arro_client import ArroClient, ArroServerError, VectorAppendResult
 from arro_nlp_frontend.config import settings
-from arro_nlp_frontend.store import Document
+from arro_nlp_frontend.embedder import Embedder
+from arro_nlp_frontend.store import Document, DocumentStore
 
 logger = logging.getLogger(__name__)
 
@@ -53,18 +55,50 @@ class IngestRequest(BaseModel):
         ),
     )
     documents: list[IngestItem] = Field(..., min_length=1)
+    incremental: bool = Field(
+        default=False,
+        description=(
+            "When True, use the incremental pipeline: classify each document as "
+            "new / changed / metadata-only, embed only new+changed, call "
+            "append_vectors for new rows and overwrite_vectors for changed rows. "
+            "When False (default), the full-rewrite pipeline is used (unchanged behaviour)."
+        ),
+    )
 
 
 class IngestResult(BaseModel):
     doc_id: str
     row_index: int
-    status: Literal["created", "updated"]
+    status: Literal["created", "updated", "skipped"]
 
 
 class IngestResponse(BaseModel):
     ingested: int
     results: list[IngestResult]
     duration_ms: int
+
+
+def _text_fingerprint(text: str) -> bytes:
+    """Return a stable 8-byte fingerprint of *text* for change detection.
+
+    Uses SHA-256 truncated to 8 bytes. Unlike Python's built-in hash(),
+    this is deterministic across processes and interpreter restarts
+    (PYTHONHASHSEED does not affect it).
+
+    This is intentionally NOT a cryptographic check -- it is only used to
+    decide whether a document's text has changed since last ingest.
+    Collision probability for 8 bytes (~1 in 18 quintillion) is acceptable
+    for this use case.
+
+    Parameters
+    ----------
+    text: The document text to fingerprint.
+
+    Returns
+    -------
+    8-byte bytes object.
+    """
+    return hashlib.sha256(text.encode()).digest()[:8]
 
 
 def _get_dataset_lock(locks: dict[str, asyncio.Lock], dataset_id: str) -> asyncio.Lock:
@@ -78,6 +112,267 @@ def _get_dataset_lock(locks: dict[str, asyncio.Lock], dataset_id: str) -> asynci
     if dataset_id not in locks:
         locks[dataset_id] = asyncio.Lock()
     return locks[dataset_id]
+
+
+# ---------------------------------------------------------------------------
+# Incremental pipeline helpers
+# ---------------------------------------------------------------------------
+#
+# Design constraints:
+#   - The per-dataset asyncio.Lock wraps ONLY the write section
+#     (consistency guard + append + overwrite + SQLite upsert).
+#     The embed step runs OUTSIDE the lock to maximise concurrency.
+#   - Text change detection uses SHA-256[:8] (deterministic across restarts).
+#     Direct text comparison (existing.text != doc.text) is equally valid but
+#     requires loading the full text for every document; the fingerprint lets
+#     us add a text_fingerprint column to the store in the future without
+#     changing this interface.
+#   - build_index is called ONCE after all writes, outside the lock.
+#     Calling it inside the lock would block concurrent requests to the same
+#     dataset for the entire index build duration (~seconds for large datasets).
+
+
+async def _run_incremental_pipeline(
+    request: IngestRequest,
+    embedder: Embedder,
+    store: DocumentStore,
+    arro_client: ArroClient,
+    locks: dict[str, asyncio.Lock],
+    root_label: str,
+) -> IngestResponse:
+    """Execute the incremental ingest pipeline.
+
+    Classification
+    --------------
+    Each document in the batch is classified into one of three buckets:
+      new_items:       doc_id not found in the store -> needs embed + append
+      changed_items:   doc_id exists but text has changed -> needs embed + overwrite
+      metadata_items:  doc_id exists and text is unchanged -> SQLite upsert only
+
+    Embed step (outside lock)
+    -------------------------
+    Only new_items and changed_items are embedded. metadata_items are skipped
+    entirely (no model call, no vector write).
+
+    Write step (inside lock)
+    ------------------------
+    1. Consistency guard: server nrows must equal store.next_row_index().
+       Raises HTTPException 409 if out of sync.
+    2. append_vectors for new_items (if any). Row indices are derived from
+       VectorAppendResult.start_row + offset.
+    3. overwrite_vectors for changed_items (if any).
+    4. upsert_batch_with_indices for new_items + changed_items (with vectors).
+    5. upsert_batch for metadata_items using their existing row_index (no vector write).
+
+    Index rebuild (outside lock)
+    ----------------------------
+    build_index is called once at the end if any new or changed documents exist.
+
+    Parameters
+    ----------
+    request:     The validated IngestRequest (incremental=True).
+    embedder:    The Embedder instance from app.state.
+    store:       The DocumentStore instance from app.state.
+    arro_client: The ArroClient instance from app.state.
+    locks:       The app.state.ingest_locks dict.
+    root_label:  Resolved root label (request.root_label or settings default).
+
+    Returns
+    -------
+    IngestResponse with per-document results and duration_ms.
+
+    Raises
+    ------
+    HTTPException 409: SQLite and Zarr row counts are out of sync.
+    HTTPException 502: arro-server returned a non-2xx or is unreachable.
+    """
+    t0 = time.perf_counter()
+
+    # ------------------------------------------------------------------
+    # Step 1 -- Classify documents
+    # ------------------------------------------------------------------
+    # Three buckets. Each item is (IngestItem, existing_row_index_or_None).
+    new_items: list[IngestItem] = []
+    changed_items: list[tuple[IngestItem, int]] = []  # (item, existing_row_index)
+    metadata_items: list[tuple[IngestItem, int]] = []  # (item, existing_row_index)
+
+    for item in request.documents:
+        existing = store.get_by_id(request.dataset_id, item.doc_id)
+        if existing is None:
+            new_items.append(item)
+        elif _text_fingerprint(existing.text) != _text_fingerprint(item.text):
+            changed_items.append((item, existing.row_index))
+        else:
+            metadata_items.append((item, existing.row_index))
+
+    # ------------------------------------------------------------------
+    # Step 2 -- Embed new + changed documents (outside lock)
+    # ------------------------------------------------------------------
+    embed_texts: list[str] = [it.text for it in new_items] + [it.text for it, _ in changed_items]
+
+    if embed_texts:
+        chunks = [embed_texts[i : i + EMBED_CHUNK] for i in range(0, len(embed_texts), EMBED_CHUNK)]
+        parts = [embedder.encode_batch(chunk) for chunk in chunks]
+        all_vecs = np.vstack(parts) if len(parts) > 1 else parts[0]
+        new_vecs = all_vecs[: len(new_items)]  # shape (N_new, dim)
+        changed_vecs = all_vecs[len(new_items) :]  # shape (N_changed, dim)
+    else:
+        # All documents are metadata-only -- no embed call needed.
+        # new_vecs and changed_vecs are unused in this branch but must be
+        # defined to satisfy the variable scope below (no append/overwrite
+        # will be called since new_items and changed_items are both empty).
+        new_vecs = np.empty((0, 0), dtype=np.float64)
+        changed_vecs = np.empty((0, 0), dtype=np.float64)
+
+    # ------------------------------------------------------------------
+    # Step 3 -- Write section (inside per-dataset lock)
+    # ------------------------------------------------------------------
+    lock = _get_dataset_lock(locks, request.dataset_id)
+    results: list[IngestResult] = []
+
+    try:
+        async with lock:
+            # 3a. Consistency guard
+            if new_items:
+                server_count = await arro_client.get_vector_count(request.dataset_id)
+                local_count = store.next_row_index(dataset_id=request.dataset_id)
+                if server_count != local_count:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Consistency error for dataset '{request.dataset_id}': "
+                            f"SQLite next_row_index={local_count} but "
+                            f"arro-server nrows={server_count}. "
+                            "Run a full re-ingest to repair the dataset before "
+                            "using incremental mode."
+                        ),
+                    )
+
+            # 3b. Append new vectors
+            if new_items:
+                append_result: VectorAppendResult = await arro_client.append_vectors(
+                    request.dataset_id, new_vecs
+                )
+                new_docs = [
+                    Document(
+                        row_index=append_result.start_row + i,
+                        doc_id=item.doc_id,
+                        text=item.text,
+                        metadata=item.metadata,
+                        ingested_at=None,
+                    )
+                    for i, item in enumerate(new_items)
+                ]
+                store.upsert_batch_with_indices(request.dataset_id, new_docs, new_vecs)
+                results.extend(
+                    IngestResult(
+                        doc_id=doc.doc_id,
+                        row_index=doc.row_index,
+                        status="created",
+                    )
+                    for doc in new_docs
+                )
+
+            # 3c. Overwrite changed vectors
+            if changed_items:
+                updates = [
+                    (row_idx, changed_vecs[i]) for i, (_, row_idx) in enumerate(changed_items)
+                ]
+                await arro_client.overwrite_vectors(request.dataset_id, updates)
+                changed_docs = [
+                    Document(
+                        row_index=row_idx,
+                        doc_id=item.doc_id,
+                        text=item.text,
+                        metadata=item.metadata,
+                        ingested_at=None,
+                    )
+                    for (item, row_idx) in changed_items
+                ]
+                store.upsert_batch_with_indices(request.dataset_id, changed_docs, changed_vecs)
+                results.extend(
+                    IngestResult(
+                        doc_id=doc.doc_id,
+                        row_index=doc.row_index,
+                        status="updated",
+                    )
+                    for doc in changed_docs
+                )
+
+            # 3d. Metadata-only upsert
+            if metadata_items:
+                meta_row_indices = [row_idx for (_, row_idx) in metadata_items]
+                all_stored_vecs = store.get_all_vectors(request.dataset_id)
+                meta_vecs = np.stack([all_stored_vecs[row_idx] for row_idx in meta_row_indices])
+                meta_docs = [
+                    Document(
+                        row_index=row_idx,
+                        doc_id=item.doc_id,
+                        text=item.text,
+                        metadata=item.metadata,
+                        ingested_at=None,
+                    )
+                    for (item, row_idx) in metadata_items
+                ]
+                store.upsert_batch_with_indices(request.dataset_id, meta_docs, meta_vecs)
+                results.extend(
+                    IngestResult(
+                        doc_id=doc.doc_id,
+                        row_index=doc.row_index,
+                        status="skipped",
+                    )
+                    for doc in meta_docs
+                )
+
+    except HTTPException:
+        raise
+    except ArroServerError as exc:
+        logger.error(
+            "[ingest][incremental] arro-server error dataset=%s: %s",
+            request.dataset_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"arro-server error: {exc}",
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # Step 4 -- Rebuild index (outside lock)
+    # ------------------------------------------------------------------
+    if new_items or changed_items:
+        try:
+            await arro_client.build_index(dataset_id=request.dataset_id)
+        except ArroServerError as exc:
+            logger.error(
+                "[ingest][incremental] build_index failed dataset=%s: %s",
+                request.dataset_id,
+                exc,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"arro-server build_index error: {exc}",
+            ) from exc
+
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    logger.info(
+        "[ingest][incremental] dataset=%s new=%d changed=%d skipped=%d elapsed=%dms",
+        request.dataset_id,
+        len(new_items),
+        len(changed_items),
+        len(metadata_items),
+        elapsed_ms,
+    )
+
+    # Restore original request order in the response.
+    doc_id_to_result = {r.doc_id: r for r in results}
+    ordered_results = [doc_id_to_result[item.doc_id] for item in request.documents]
+
+    return IngestResponse(
+        ingested=len(ordered_results),
+        results=ordered_results,
+        duration_ms=elapsed_ms,
+    )
 
 
 @router.post("/ingest", response_model=IngestResponse, status_code=200)
@@ -140,7 +435,18 @@ async def ingest(
             detail=f"Duplicate doc_ids in request: {duplicates}",
         )
 
-    # Step 2 -- embed in chunks to avoid OOM on large requests
+    # Step 2 -- Route to incremental pipeline if requested
+    if request.incremental:
+        return await _run_incremental_pipeline(
+            request=request,
+            embedder=embedder,
+            store=store,
+            arro_client=arro_client,
+            locks=req.app.state.ingest_locks,
+            root_label=root_label,
+        )
+
+    # Step 2 (full path) -- embed in chunks to avoid OOM on large requests
     texts = [item.text for item in request.documents]
     chunks = [texts[i : i + EMBED_CHUNK] for i in range(0, len(texts), EMBED_CHUNK)]
     parts = [embedder.encode_batch(chunk) for chunk in chunks]

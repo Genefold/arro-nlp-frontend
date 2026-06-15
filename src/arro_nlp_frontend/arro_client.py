@@ -16,7 +16,14 @@ from typing import cast
 import httpx
 import numpy as np
 
-__all__ = ["ArroServerError", "ArroClient", "UploadCommitResult", "SearchHit"]
+__all__ = [
+    "ArroServerError",
+    "ArroClient",
+    "UploadCommitResult",
+    "VectorAppendResult",
+    "VectorOverwriteResult",
+    "SearchHit",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +42,34 @@ class UploadCommitResult:
 
     index_stale: bool
     shape: list[int]
+
+
+@dataclass
+class VectorAppendResult:
+    """Result returned by POST /api/datasets/{id}/vectors/append.
+
+    Attributes
+    ----------
+    start_row:  Index of the first appended row in the Zarr array.
+    appended:   Number of rows actually appended (== len(vectors) sent).
+    new_shape:  Full array shape after the append, e.g. [300200, 384].
+    """
+
+    start_row: int
+    appended: int
+    new_shape: list[int]
+
+
+@dataclass
+class VectorOverwriteResult:
+    """Result returned by POST /api/datasets/{id}/vectors/overwrite.
+
+    Attributes
+    ----------
+    overwritten: Number of rows that were updated in-place.
+    """
+
+    overwritten: int
 
 
 @dataclass
@@ -158,6 +193,137 @@ class ArroClient:
                 f"arro-server POST {url} returned {response.status_code}: {response.text}",
                 status_code=response.status_code,
             )
+
+    async def append_vectors(
+        self,
+        dataset_id: str,
+        vectors: np.ndarray,
+    ) -> VectorAppendResult:
+        """POST /api/datasets/{dataset_id}/vectors/append
+
+        Appends *vectors* as new rows at the end of the existing Zarr array.
+        The server assigns row indices starting at the current array length --
+        the caller must NOT assume a specific start_row before the call returns.
+
+        Parameters
+        ----------
+        dataset_id: arro-server dataset identifier (e.g. "main--cve").
+        vectors:    Float64 array of shape (M, dim). M >= 1.
+
+        Returns
+        -------
+        VectorAppendResult with start_row, appended, and new_shape.
+
+        Raises
+        ------
+        ArroServerError: any non-2xx response or network failure.
+        ValueError:      if vectors is empty (shape[0] == 0).
+        """
+        if vectors.shape[0] == 0:
+            raise ValueError("append_vectors: vectors must not be empty (shape[0] == 0)")
+
+        payload = {"vectors": vectors.tolist()}
+        url = f"/api/datasets/{dataset_id}/vectors/append"
+        try:
+            response = await self._client.post(url, json=payload)
+        except httpx.RequestError as exc:
+            raise ArroServerError(str(exc), status_code=None) from exc
+
+        if response.status_code >= 400:
+            raise ArroServerError(
+                f"arro-server POST {url} returned {response.status_code}: {response.text}",
+                status_code=response.status_code,
+            )
+        data = response.json()
+        return VectorAppendResult(
+            start_row=int(data["start_row"]),
+            appended=int(data["appended"]),
+            new_shape=list(data["new_shape"]),
+        )
+
+    async def overwrite_vectors(
+        self,
+        dataset_id: str,
+        updates: list[tuple[int, np.ndarray]],
+    ) -> VectorOverwriteResult:
+        """POST /api/datasets/{dataset_id}/vectors/overwrite
+
+        Overwrites specific rows in the Zarr array in-place.
+        The array shape does not change -- only values at the given row indices
+        are replaced. Row indices must already exist in the array.
+
+        Parameters
+        ----------
+        dataset_id: arro-server dataset identifier.
+        updates:    Non-empty list of (row_index, vector) pairs.
+                    Each vector must have the same dimensionality as the array.
+
+        Returns
+        -------
+        VectorOverwriteResult with overwritten count.
+
+        Raises
+        ------
+        ArroServerError: any non-2xx response or network failure.
+        ValueError:      if updates is empty.
+        """
+        if not updates:
+            raise ValueError("overwrite_vectors: updates must not be empty")
+
+        payload = {
+            "updates": [{"row_index": row_idx, "vector": vec.tolist()} for row_idx, vec in updates]
+        }
+        url = f"/api/datasets/{dataset_id}/vectors/overwrite"
+        try:
+            response = await self._client.post(url, json=payload)
+        except httpx.RequestError as exc:
+            raise ArroServerError(str(exc), status_code=None) from exc
+
+        if response.status_code >= 400:
+            raise ArroServerError(
+                f"arro-server POST {url} returned {response.status_code}: {response.text}",
+                status_code=response.status_code,
+            )
+        data = response.json()
+        return VectorOverwriteResult(overwritten=int(data["overwritten"]))
+
+    async def get_vector_count(self, dataset_id: str) -> int:
+        """GET /api/datasets/{dataset_id}/vectors/count
+
+        Returns the current row count (nrows) of the dataset from the
+        arro-server registry cache. This is an O(1) call when the cache
+        is warm. The value is a snapshot -- a concurrent append may produce
+        a higher value immediately after this call returns.
+
+        Used as a pre-flight consistency guard before incremental writes:
+        if the returned count differs from store.next_row_index(), the two
+        stores are out of sync and the incremental path must not proceed.
+
+        Parameters
+        ----------
+        dataset_id: arro-server dataset identifier.
+
+        Returns
+        -------
+        nrows as int.
+
+        Raises
+        ------
+        ArroServerError: any non-2xx response or network failure,
+                         including 404 if the dataset does not exist.
+        """
+        url = f"/api/datasets/{dataset_id}/vectors/count"
+        try:
+            response = await self._client.get(url)
+        except httpx.RequestError as exc:
+            raise ArroServerError(str(exc), status_code=None) from exc
+
+        if response.status_code >= 400:
+            raise ArroServerError(
+                f"arro-server GET {url} returned {response.status_code}: {response.text}",
+                status_code=response.status_code,
+            )
+        return int(response.json()["nrows"])
 
     async def search(
         self,
