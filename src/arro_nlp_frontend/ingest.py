@@ -223,11 +223,11 @@ async def _run_incremental_pipeline(
         changed_vecs = all_vecs[len(new_items) :]       # shape (N_changed, dim)
     else:
         # All documents are metadata-only -- no embed call needed.
-        dim = store.get_all_vectors(request.dataset_id).shape[1] if (
-            store.count(request.dataset_id) > 0
-        ) else 0
-        new_vecs     = np.empty((0, dim), dtype=np.float64)
-        changed_vecs = np.empty((0, dim), dtype=np.float64)
+        # new_vecs and changed_vecs are unused in this branch but must be
+        # defined to satisfy the variable scope below (no append/overwrite
+        # will be called since new_items and changed_items are both empty).
+        new_vecs     = np.empty((0, 0), dtype=np.float64)
+        changed_vecs = np.empty((0, 0), dtype=np.float64)
 
     # ------------------------------------------------------------------
     # Step 3 -- Write section (inside per-dataset lock)
@@ -311,6 +311,9 @@ async def _run_incremental_pipeline(
 
             # 3d. Metadata-only upsert
             if metadata_items:
+                meta_row_indices = [row_idx for (_, row_idx) in metadata_items]
+                all_stored_vecs = store.get_all_vectors(request.dataset_id)
+                meta_vecs = np.stack([all_stored_vecs[row_idx] for row_idx in meta_row_indices])
                 meta_docs = [
                     Document(
                         row_index=row_idx,
@@ -321,17 +324,6 @@ async def _run_incremental_pipeline(
                     )
                     for (item, row_idx) in metadata_items
                 ]
-                meta_vecs = np.stack([
-                    np.frombuffer(
-                        store._conn.execute(  # type: ignore[union-attr]
-                            "SELECT vector FROM documents "
-                            "WHERE dataset_id = ? AND row_index = ?",
-                            (request.dataset_id, row_idx),
-                        ).fetchone()[0],
-                        dtype=np.float64,
-                    )
-                    for (_, row_idx) in metadata_items
-                ])
                 store.upsert_batch_with_indices(
                     request.dataset_id, meta_docs, meta_vecs
                 )
