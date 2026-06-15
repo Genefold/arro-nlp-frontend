@@ -245,6 +245,92 @@ class DocumentStore:
 
         return statuses
 
+    def upsert_batch_with_indices(
+        self,
+        dataset_id: str,
+        docs: list[Document],
+        vectors: np.ndarray,
+    ) -> list[Literal["created", "updated"]]:
+        """Atomically insert or replace documents using each Document's own row_index.
+
+        Unlike upsert_batch(), row indices are NOT assigned sequentially from a
+        start_row. Instead, each Document carries its own pre-assigned row_index.
+        This is required for the incremental ingest path where:
+          - new documents have row indices returned by append_vectors()
+          - changed documents keep their original row indices from the store
+
+        The two groups are non-contiguous and cannot be expressed as start_row + i.
+
+        Concurrency
+        -----------
+        The caller (ingest endpoint) is responsible for holding the per-dataset
+        asyncio.Lock for the entire duration of embed + append + overwrite + upsert.
+        This method does not acquire any lock itself.
+
+        Parameters
+        ----------
+        dataset_id: Dataset identifier (e.g. "cve/embeddings").
+        docs:       Non-empty list of Document objects. Each doc.row_index must
+                    be >= 0 and unique within the batch.
+        vectors:    Float64 array of shape (N, dim). Must match len(docs).
+                    vectors[i] corresponds to docs[i].
+
+        Returns
+        -------
+        List of "created" or "updated" per document, in the same order as docs.
+
+        Raises
+        ------
+        ValueError: If docs is empty, vectors shape mismatches, or any
+                    doc.row_index is negative.
+        """
+        if not docs:
+            raise ValueError("docs cannot be empty")
+        if len(docs) != vectors.shape[0]:
+            raise ValueError(
+                f"vectors shape {vectors.shape} does not match doc count {len(docs)}"
+            )
+        if any(doc.row_index < 0 for doc in docs):
+            raise ValueError("all doc.row_index values must be >= 0")
+
+        now = datetime.now(UTC).isoformat()
+        batch_data = [
+            (
+                dataset_id,
+                doc.row_index,        # pre-assigned, not start_row + i
+                doc.doc_id,
+                doc.text,
+                vectors[i].tobytes(),
+                json.dumps(doc.metadata),
+                now,
+            )
+            for i, doc in enumerate(docs)
+        ]
+
+        statuses: list[Literal["created", "updated"]] = [
+            "updated" if self.get_by_id(dataset_id, doc.doc_id) else "created"
+            for doc in docs
+        ]
+
+        assert self._conn is not None
+        with self._conn:
+            self._conn.executemany(
+                """
+                INSERT OR REPLACE INTO documents
+                    (dataset_id, row_index, doc_id, text, vector, metadata, ingested_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                batch_data,
+            )
+
+        logger.info(
+            "[store] upserted %d documents (with_indices) dataset=%s",
+            len(docs),
+            dataset_id,
+        )
+
+        return statuses
+
     def get_by_row(self, dataset_id: str, row_index: int) -> Document | None:
         """Return the document at row_index for the given dataset, or None if not found."""
         assert self._conn is not None

@@ -23,7 +23,12 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from arro_nlp_frontend.arro_client import ArroClient, UploadCommitResult
+from arro_nlp_frontend.arro_client import (
+    ArroClient,
+    UploadCommitResult,
+    VectorAppendResult,
+    VectorOverwriteResult,
+)
 from arro_nlp_frontend.embedder import Embedder
 from arro_nlp_frontend.main import create_app
 from arro_nlp_frontend.store import DocumentStore
@@ -62,18 +67,31 @@ def store(tmp_path: Path) -> Generator[DocumentStore, None, None]:
 
 @pytest.fixture
 def mock_arro_client() -> AsyncMock:
-    """AsyncMock with new ArroClient methods pre-configured.
+    """AsyncMock of ArroClient with all methods pre-configured.
 
-    All methods now accept dataset_id as the first positional argument.
+    New methods for incremental ingest (issue #21):
+      - append_vectors:    returns VectorAppendResult(start_row=0, appended=1, new_shape=[1, 384])
+      - overwrite_vectors: returns VectorOverwriteResult(overwritten=1)
+      - get_vector_count:  returns 0 (empty dataset by default)
+
+    Tests that require specific return values should override these defaults
+    using mock_arro.append_vectors.return_value = VectorAppendResult(...).
     """
     client = AsyncMock(spec=ArroClient)
-    client.dataset_metadata = AsyncMock(return_value=None)
-    client.upload_init = AsyncMock(return_value="/tmp/arro_test_upload.zarr")
-    client.upload_commit = AsyncMock(
+    client.dataset_metadata  = AsyncMock(return_value=None)
+    client.upload_init       = AsyncMock(return_value="/tmp/arro_test_upload.zarr")
+    client.upload_commit     = AsyncMock(
         return_value=UploadCommitResult(index_stale=False, shape=[0, 384])
     )
-    client.build_index = AsyncMock(return_value=None)
-    client.search = AsyncMock(return_value=[])
+    client.build_index       = AsyncMock(return_value=None)
+    client.search            = AsyncMock(return_value=[])
+    client.append_vectors    = AsyncMock(
+        return_value=VectorAppendResult(start_row=0, appended=1, new_shape=[1, 384])
+    )
+    client.overwrite_vectors = AsyncMock(
+        return_value=VectorOverwriteResult(overwritten=1)
+    )
+    client.get_vector_count  = AsyncMock(return_value=0)
     return client
 
 

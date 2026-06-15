@@ -317,3 +317,104 @@ These fix silent data corruption, not features:
 2. Multi-worker safety: `BEGIN EXCLUSIVE` (same-host) or ARQ + Redis queue (multi-host).
 3. Search LRU cache: cache `(query_hash, top_k, tau)` → results with configurable TTL.
 4. Arrow IPC vector transport: replace JSON with Arrow IPC for ingest and search payloads..
+
+
+
+
+Ho tutto il quadro. Ecco lo storyline completo basato solo su issue e codice reale.
+
+***
+
+## Storyline di implementazione
+
+### Sprint 0 — Fondamenta lato server
+**Parallelo, zero dipendenze**
+
+Le tre issue di arro-server non dipendono da nulla di nuovo e possono partire subito tutte e tre in parallelo su branch dedicati.
+
+**[arro-server #34](https://github.com/Genefold/arro-server/issues/34)** — `POST /vectors/append`
+`zarr_fs.py` apre oggi solo in `mode="r"`. La prima modifica è aggiungere `append_vectors()` che apre in `mode="r+"`, fa `resize()` e scrive il slice `[old_n:]`. Poi si aggiunge la route in `routes.py` e si chiama `registry.register_dataset()` per aggiornare la shape in cache. I test verificano che la shape cresca e che `start_row` nel response sia corretto.
+
+**[arro-server #35](https://github.com/Genefold/arro-server/issues/35)** — `POST /vectors/overwrite`
+Stessa meccanica di #34 ma con write a indici arbitrari `arr[row_index] = vec`. Valida i bounds prima di qualsiasi write per evitare corruzione parziale. Questo issue, una volta merged, chiude anche la root cause di arro-nlp-frontend #12 (silent stale vector bug). 
+
+**[arro-server #36](https://github.com/Genefold/arro-server/issues/36)** — `GET /vectors/count`
+Endpoint lightweight: legge `shape` dal `DatasetSummary` in cache (O(1), nessuna I/O su Zarr). Serve come consistency guard prima che arro-nlp-frontend faccia append. 
+
+***
+
+### Sprint 1 — Search: la feature più urgente
+**Dipende da: arro-server già funzionante (esistente)**
+
+**[arro-nlp-frontend #22](https://github.com/Genefold/arro-nlp-frontend/issues/22)** — `POST /search`
+
+Questo si può iniziare **in parallelo con Sprint 0** perché l'endpoint di search su arro-server esiste già — bisogna solo verificarne la firma in `routes.py` prima di implementare `ArroClient.search()`. Il lavoro è:
+
+1. Aggiungere `DocumentStore.get_by_row_indices()` in `store.py` — una singola query `WHERE row_index IN (...)`
+2. Aggiungere `ArroClient.search()` in `arro_client.py`
+3. Scrivere `router/search.py` con `POST /search`
+4. Registrarlo in `main.py`
+
+Il ghost-row handling (doc_id non in SQLite → skip silenzioso + WARNING) è già specificato nella issue. 
+
+La search è la feature più visibile per arro-cve-search e non blocca nulla di Sprint 0 — va in parallelo.
+
+***
+
+### Sprint 2 — Ingest incrementale
+**Dipende da: Sprint 0 completato (#34, #35, #36)**
+
+**[arro-nlp-frontend #21](https://github.com/Genefold/arro-nlp-frontend/issues/21)** — `POST /ingest?incremental=true`
+
+Solo ora che i tre endpoint di arro-server esistono si può implementare il branch incrementale in `ingest.py`. Il lavoro si divide in due parti separate:
+
+**Parte A — client methods** (in `arro_client.py`): aggiungere `append_vectors()`, `overwrite_vectors()`, `get_vector_count()`. Sono wrapper HTTP puri, testabili con mock indipendentemente dal resto.
+
+**Parte B — logica di branching** (in `ingest.py`): aggiungere `incremental: bool = False` a `IngestRequest`, implementare il diff (`new` / `changed` / `metadata_only`), chiamare append o overwrite dentro il lock esistente (`_get_dataset_lock`), e chiamare `build_index` **una sola volta** alla fine del batch — non dentro il loop. 
+
+Il consistency guard (confronto `get_vector_count()` vs `store.next_row_index()`) va implementato come prima cosa dentro il lock, prima di qualsiasi write.
+
+***
+
+### Sprint 3 — CRUD documenti e qualità
+**Dipende da: Sprint 1 completato**
+
+**[arro-nlp-frontend #8](https://github.com/Genefold/arro-nlp-frontend/issues/8)** — `GET /documents/{doc_id}` e `DELETE /documents/{doc_id}`
+
+Con la search funzionante, il CRUD sui documenti chiude il loop: un utente può cercare una CVE, ottenerla per ID, e rimuoverla. La delete è soft: rimuove solo da SQLite, non da Zarr — il ghost handling nella search già copre questo caso. 
+
+**[arro-nlp-frontend #15](https://github.com/Genefold/arro-nlp-frontend/issues/15)** — Typed `AppState`
+
+Da fare nello stesso sprint perché ogni nuovo endpoint (`/search`, `/documents`) accede a `app.state`. Aggiungere `AppState` dataclass e `get_state(req)` ora, prima che lo stato si allarghi ulteriormente. 
+
+***
+
+### Backlog — Non bloccante per produzione
+
+| Issue | Quando |
+|---|---|
+| [arro-nlp-frontend #13](https://github.com/Genefold/arro-nlp-frontend/issues/13) — multi-worker lock | Solo se si scala oltre un processo |
+| [arro-nlp-frontend #14](https://github.com/Genefold/arro-nlp-frontend/issues/14) — binary transport | Quando i batch superano 500 doc |
+| [arro-server #26](https://github.com/Genefold/arro-server/issues/26) — async build_index | Quando ci sono build concorrenti |
+| [arro-server #16](https://github.com/Genefold/arro-server/issues/16) — only 2D arrays | Già in progress, non blocca pipeline CVE |
+
+***
+
+### Grafico delle dipendenze
+
+```
+arro-server
+  #34 append ──┐
+  #35 overwrite─┼──► nlp-frontend #21 (ingest incrementale)
+  #36 count   ──┘
+
+arro-server (search esistente) ──► nlp-frontend #22 (search)
+                                         │
+                                         ▼
+                                   nlp-frontend #8 (CRUD)
+                                   nlp-frontend #15 (typed state)
+```
+
+Il **minimum viable path** per portare arro-cve-search in produzione è: `#34 + #35 + #36` → `#21 + #22` in parallelo → deploy. Il CRUD (#8) e il typed state (#15) migliorano la qualità ma non bloccano.
+
+
