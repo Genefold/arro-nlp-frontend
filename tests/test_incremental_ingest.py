@@ -13,7 +13,7 @@ Test index
         row indices preserved, no append call.
  3. test_incremental_metadata_only_no_embed_no_vector_write
         Pre-existing docs, text unchanged -> neither append nor overwrite
-        called.
+        called; encode_batch NOT called.
  4. test_incremental_build_index_called_once_for_mixed_batch
         Mixed batch (new + changed + metadata-only) -> build_index called
         exactly once.
@@ -182,31 +182,39 @@ def test_incremental_changed_docs_overwritten(ingest_client):
 
 
 def test_incremental_metadata_only_no_embed_no_vector_write(ingest_client):
-    """Unchanged text -> no vector writes.
+    """Unchanged text -> no embed call, no vector writes.
 
     Verifies:
     - append_vectors NOT called
     - overwrite_vectors NOT called
+    - embedder.encode_batch NOT called (no embed needed for metadata-only)
     - status is "skipped"
-    - store metadata is updated (text unchanged but metadata may differ)
+    - store metadata is updated even though text and vector are unchanged
     """
+    from unittest.mock import patch
+
     client, store, mock_arro = ingest_client
 
     _seed_store(store, DEFAULT_DS, [
         {"doc_id": "doc0", "text": "unchanged text", "row_index": 0},
     ])
 
-    r = _post_incremental(
-        client,
-        [{"doc_id": "doc0", "text": "unchanged text", "metadata": {"updated": True}}],
-    )
-    assert r.status_code == 200, r.json()
+    embedder = client.app.state.embedder
+    with patch.object(embedder, "encode_batch", wraps=embedder.encode_batch) as mock_encode:
+        r = _post_incremental(
+            client,
+            [{"doc_id": "doc0", "text": "unchanged text", "metadata": {"updated": True}}],
+        )
+        assert r.status_code == 200, r.json()
 
-    assert r.json()["results"][0]["status"] == "skipped"
-    mock_arro.append_vectors.assert_not_called()
-    mock_arro.overwrite_vectors.assert_not_called()
+        assert r.json()["results"][0]["status"] == "skipped"
+        mock_arro.append_vectors.assert_not_called()
+        mock_arro.overwrite_vectors.assert_not_called()
 
-    # Metadata updated in store.
+        # Core assertion: encode_batch must NOT be called for metadata-only.
+        mock_encode.assert_not_called()
+
+    # Metadata must be persisted in SQLite.
     doc = store.get_by_id(DEFAULT_DS, "doc0")
     assert doc is not None
     assert doc.metadata == {"updated": True}

@@ -7,11 +7,10 @@ Pipeline: validate -> embed (chunked) -> lock -> next_row_index -> persist ->
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from typing import Literal
-
-import hashlib
 
 import numpy as np
 import zarr
@@ -23,6 +22,96 @@ from arro_nlp_frontend.config import settings
 from arro_nlp_frontend.store import Document
 
 logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+EMBED_CHUNK = settings.ingest_batch_size
+
+
+class IngestItem(BaseModel):
+    """A single document to ingest."""
+
+    doc_id: str = Field(..., min_length=1)
+    text: str = Field(..., min_length=1)
+    metadata: dict = Field(default_factory=dict)
+
+
+class IngestRequest(BaseModel):
+    """Request body for POST /ingest."""
+
+    dataset_id: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "arro-server dataset identifier, e.g. 'cve/embeddings' or 'nvd/embeddings'. "
+            "All documents in this batch are associated with this dataset."
+        ),
+    )
+    root_label: str = Field(
+        default="",
+        description=(
+            "arro-server data root label. Defaults to settings.arro_server_root_label when empty."
+        ),
+    )
+    documents: list[IngestItem] = Field(..., min_length=1)
+    incremental: bool = Field(
+        default=False,
+        description=(
+            "When True, use the incremental pipeline: classify each document as "
+            "new / changed / metadata-only, embed only new+changed, call "
+            "append_vectors for new rows and overwrite_vectors for changed rows. "
+            "When False (default), the full-rewrite pipeline is used (unchanged behaviour)."
+        ),
+    )
+
+
+class IngestResult(BaseModel):
+    doc_id: str
+    row_index: int
+    status: Literal["created", "updated", "skipped"]
+
+
+class IngestResponse(BaseModel):
+    ingested: int
+    results: list[IngestResult]
+    duration_ms: int
+
+
+def _text_fingerprint(text: str) -> bytes:
+    """Return a stable 8-byte fingerprint of *text* for change detection.
+
+    Uses SHA-256 truncated to 8 bytes. Unlike Python's built-in hash(),
+    this is deterministic across processes and interpreter restarts
+    (PYTHONHASHSEED does not affect it).
+
+    This is intentionally NOT a cryptographic check -- it is only used to
+    decide whether a document's text has changed since last ingest.
+    Collision probability for 8 bytes (~1 in 18 quintillion) is acceptable
+    for this use case.
+
+    Parameters
+    ----------
+    text: The document text to fingerprint.
+
+    Returns
+    -------
+    8-byte bytes object.
+    """
+    return hashlib.sha256(text.encode()).digest()[:8]
+
+
+def _get_dataset_lock(locks: dict[str, asyncio.Lock], dataset_id: str) -> asyncio.Lock:
+    """Return the asyncio.Lock for *dataset_id*, creating it lazily if absent.
+
+    Thread-safety note: this function must only be called from within the
+    asyncio event loop (single-threaded). Dict mutation here is safe because
+    asyncio is cooperative: no two coroutines can reach this point concurrently
+    for the same dataset_id without one of them already holding the lock.
+    """
+    if dataset_id not in locks:
+        locks[dataset_id] = asyncio.Lock()
+    return locks[dataset_id]
+
 
 # ---------------------------------------------------------------------------
 # Incremental pipeline helpers
@@ -304,96 +393,6 @@ async def _run_incremental_pipeline(
         results=ordered_results,
         duration_ms=elapsed_ms,
     )
-
-
-router = APIRouter()
-
-EMBED_CHUNK = settings.ingest_batch_size
-
-
-class IngestItem(BaseModel):
-    """A single document to ingest."""
-
-    doc_id: str = Field(..., min_length=1)
-    text: str = Field(..., min_length=1)
-    metadata: dict = Field(default_factory=dict)
-
-
-class IngestRequest(BaseModel):
-    """Request body for POST /ingest."""
-
-    dataset_id: str = Field(
-        ...,
-        min_length=1,
-        description=(
-            "arro-server dataset identifier, e.g. 'cve/embeddings' or 'nvd/embeddings'. "
-            "All documents in this batch are associated with this dataset."
-        ),
-    )
-    root_label: str = Field(
-        default="",
-        description=(
-            "arro-server data root label. Defaults to settings.arro_server_root_label when empty."
-        ),
-    )
-    documents: list[IngestItem] = Field(..., min_length=1)
-    incremental: bool = Field(
-        default=False,
-        description=(
-            "When True, use the incremental pipeline: classify each document as "
-            "new / changed / metadata-only, embed only new+changed, call "
-            "append_vectors for new rows and overwrite_vectors for changed rows. "
-            "When False (default), the full-rewrite pipeline is used (unchanged behaviour)."
-        ),
-    )
-
-
-class IngestResult(BaseModel):
-    doc_id: str
-    row_index: int
-    status: Literal["created", "updated", "skipped"]
-
-
-class IngestResponse(BaseModel):
-    ingested: int
-    results: list[IngestResult]
-    duration_ms: int
-
-
-def _text_fingerprint(text: str) -> bytes:
-    """Return a stable 8-byte fingerprint of *text* for change detection.
-
-    Uses SHA-256 truncated to 8 bytes. Unlike Python's built-in hash(),
-    this is deterministic across processes and interpreter restarts
-    (PYTHONHASHSEED does not affect it).
-
-    This is intentionally NOT a cryptographic check -- it is only used to
-    decide whether a document's text has changed since last ingest.
-    Collision probability for 8 bytes (~1 in 18 quintillion) is acceptable
-    for this use case.
-
-    Parameters
-    ----------
-    text: The document text to fingerprint.
-
-    Returns
-    -------
-    8-byte bytes object.
-    """
-    return hashlib.sha256(text.encode()).digest()[:8]
-
-
-def _get_dataset_lock(locks: dict[str, asyncio.Lock], dataset_id: str) -> asyncio.Lock:
-    """Return the asyncio.Lock for *dataset_id*, creating it lazily if absent.
-
-    Thread-safety note: this function must only be called from within the
-    asyncio event loop (single-threaded). Dict mutation here is safe because
-    asyncio is cooperative: no two coroutines can reach this point concurrently
-    for the same dataset_id without one of them already holding the lock.
-    """
-    if dataset_id not in locks:
-        locks[dataset_id] = asyncio.Lock()
-    return locks[dataset_id]
 
 
 @router.post("/ingest", response_model=IngestResponse, status_code=200)
