@@ -342,7 +342,7 @@ class ArroClient:
             "vector": vector.tolist(),
             "k": top_k,
             "tau": tau,
-            "mode": "tau",
+            "mode": "taumode",
         }
         url = f"/api/datasets/{dataset_id}/search"
         try:
