@@ -1,0 +1,24 @@
+# Version control
+.git
+.github
+**/.git
+
+# Python artifacts
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+
+# Test suite — not needed in image
+tests/
+
+# Local secrets — never bake into image
+.env
+.env.*
+
+# Dev tooling
+.pre-commit-config.yaml
+
+# Docs — not needed at runtime, except README.md (hatchling build requires it)
+*.md
+!README.md
