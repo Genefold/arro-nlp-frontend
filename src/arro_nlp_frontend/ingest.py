@@ -493,7 +493,6 @@ async def ingest(
                 mode="w",
                 shape=all_vectors.shape,
                 dtype="float64",
-                zarr_version=3,
             )
             arr[:] = all_vectors
 

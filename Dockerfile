@@ -43,8 +43,8 @@ RUN uv sync --frozen --no-dev
 # /app/data  → SQLite document store (store_db_path default: ./data/documents.sqlite)
 # HF_HOME    → sentence-transformers model cache (mount as named volume in compose)
 RUN adduser --disabled-password --gecos "" appuser \
-    && mkdir -p /app/data /home/appuser/.cache/huggingface \
-    && chown -R appuser:appuser /app /home/appuser/.cache
+    && mkdir -p /data /app/data /home/appuser/.cache/huggingface \
+    && chown -R appuser:appuser /data /app /home/appuser/.cache
 
 USER appuser
 
