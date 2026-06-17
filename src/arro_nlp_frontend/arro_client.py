@@ -356,8 +356,9 @@ class ArroClient:
                 status_code=response.status_code,
             )
 
-        raw: list[dict] = response.json()
-        return [SearchHit(index=int(hit["index"]), score=float(hit["score"])) for hit in raw]
+        raw = response.json()
+        hits: list[dict] = raw["results"]
+        return [SearchHit(index=int(hit["index"]), score=float(hit["score"])) for hit in hits]
 
     async def aclose(self) -> None:
         """Close the underlying httpx.AsyncClient."""
