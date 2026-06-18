@@ -342,7 +342,7 @@ async def _run_incremental_pipeline(
     # ------------------------------------------------------------------
     if new_items or changed_items:
         try:
-            await arro_client.build_index(dataset_id=request.dataset_id)
+            await arro_client.build_index(dataset_id=request.dataset_id, timeout=600.0)
         except ArroServerError as exc:
             logger.error(
                 "[ingest][incremental] build_index failed dataset=%s: %s",
@@ -501,9 +501,13 @@ async def ingest(
                 dataset_id=request.dataset_id, fs_path=upload_path
             )
 
-            # 5f. Rebuild index if stale or new dataset
+            # 5f. Rebuild index if stale or new dataset.
+            # Index builds on large datasets take several minutes; use a
+            # generous per-request timeout to avoid httpx.ReadTimeout.
             if commit_result.index_stale or is_new:
-                await arro_client.build_index(dataset_id=request.dataset_id)
+                await arro_client.build_index(
+                    dataset_id=request.dataset_id, timeout=600.0
+                )
 
         except ArroServerError as exc:
             logger.error(

@@ -173,18 +173,29 @@ class ArroClient:
             shape=list(data["shape"]),
         )
 
-    async def build_index(self, dataset_id: str, graph_params: dict | None = None) -> None:
+    async def build_index(
+        self,
+        dataset_id: str,
+        graph_params: dict | None = None,
+        timeout: float | None = None,
+    ) -> None:
         """POST /api/datasets/{dataset_id}/index
 
         Body: {"graph_params": graph_params} or {} for server defaults.
         Raises ArroServerError on failure.
+
+        Parameters
+        ----------
+        timeout:  Per-request timeout override.  Index builds on large
+                  datasets can take several minutes; set to 600 or higher.
+                  Pass None to use the client default (30 s).
         """
         payload: dict = {}
         if graph_params is not None:
             payload["graph_params"] = graph_params
         url = f"/api/datasets/{dataset_id}/index"
         try:
-            response = await self._client.post(url, json=payload)
+            response = await self._client.post(url, json=payload, timeout=timeout)
         except httpx.RequestError as exc:
             raise ArroServerError(str(exc), status_code=None) from exc
 
