@@ -396,18 +396,18 @@ async def ingest(
     protect the row_index counter and the Zarr rewrite.
 
     Pipeline:
-      1. Validate: non-empty list, no duplicate doc_ids within the batch
-      2. Embed texts in chunks of EMBED_CHUNK -> float64 array (N, dim)
-      2a. (inside lock) -- per-dataset lock acquired via `_get_dataset_lock`
-      3. (inside lock) start_row = store.next_row_index()
-      4. (inside lock) upsert_batch into SQLite with vectors
-      5. (inside lock) Sync to arro-server:
-         a. Read ALL vectors from SQLite for this dataset (full matrix)
-         b. Check if dataset exists (dataset_metadata -> 404 = new)
-         c. upload_init -> upload_path
-         d. Write Zarr v3 array to upload_path
-         e. upload_commit -> index_stale
-         f. If index_stale or new dataset -> build_index
+       1. Validate: non-empty list, no duplicate doc_ids within the batch
+       2. Embed texts in chunks of EMBED_CHUNK -> float64 array (N, dim)
+       2a. (inside lock) -- per-dataset lock acquired via `_get_dataset_lock`
+       3. (inside lock) start_row = store.next_row_index()
+       4. (inside lock) upsert_batch into SQLite with vectors
+       5. (inside lock) Sync to arro-server:
+          a. Read ALL vectors from SQLite for this dataset (full matrix)
+          b. upload_init -> upload_path
+          c. Write Zarr v3 array to upload_path
+          d. upload_commit
+          e. build_index (always on full re-ingest; see issue #26)
+             On incremental: only if new_items or changed_items exist.
 
     Raises:
       422: duplicate doc_ids within the batch
@@ -474,11 +474,7 @@ async def ingest(
             # 5a. Read ALL current vectors from store
             all_vectors = store.get_all_vectors(dataset_id=request.dataset_id)
 
-            # 5b. Check if the dataset already exists on arro-server
-            meta = await arro_client.dataset_metadata(dataset_id=request.dataset_id)
-            is_new = meta is None
-
-            # 5c. Initialise an upload slot on arro-server.
+            # 5b. Initialise an upload slot on arro-server.
             # upload_init validates dataset_id + root and registers the slot.
             # If arro_server_upload_path is set, we override the returned path
             # (shared-volume deployments) but still call upload_init to register.
@@ -487,7 +483,7 @@ async def ingest(
             )
             upload_path = settings.arro_server_upload_path or server_upload_path
 
-            # 5d. Write the full embedding matrix as a Zarr v3 array
+            # 5c. Write the full embedding matrix as a Zarr v3 array
             arr = zarr.open_array(
                 upload_path,
                 mode="w",
@@ -496,18 +492,22 @@ async def ingest(
             )
             arr[:] = all_vectors
 
-            # 5e. Commit the upload
-            commit_result = await arro_client.upload_commit(
+            # 5d. Commit the upload
+            await arro_client.upload_commit(
                 dataset_id=request.dataset_id, fs_path=upload_path
             )
 
-            # 5f. Rebuild index if stale or new dataset.
+            # 5e. Always rebuild the index on full re-ingest.
             # Index builds on large datasets take several minutes; use a
             # generous per-request timeout to avoid httpx.ReadTimeout.
-            if commit_result.index_stale or is_new:
-                await arro_client.build_index(
-                    dataset_id=request.dataset_id, timeout=600.0
-                )
+            # Unconditional: after a volume wipe (down -v), arro-server can
+            # report index_stale=False (data identical to bulk) and
+            # is_new=False (dataset metadata exists) even though the physical
+            # index is gone.  Calling build_index unconditionally is safe:
+            # if the index is already valid, arro-server returns quickly.
+            await arro_client.build_index(
+                dataset_id=request.dataset_id, timeout=600.0
+            )
 
         except ArroServerError as exc:
             logger.error(

@@ -37,11 +37,9 @@ Test index
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock
 
 import numpy as np
-import pytest
 
 from arro_nlp_frontend.arro_client import (
     ArroServerError,
@@ -250,7 +248,7 @@ def test_incremental_build_index_called_once_for_mixed_batch(ingest_client):
         ],
     )
     assert r.status_code == 200, r.json()
-    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS)
+    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS, timeout=600.0)
 
 
 # ---------------------------------------------------------------------------

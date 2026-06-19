@@ -19,10 +19,13 @@ Tests
 15. Metadata round-trips correctly
 16. build_index called when index_stale=True
 17. build_index called for new dataset (metadata returns None)
-18. Two datasets have independent row indices
-19. root_label override forwarded to upload_init
-20. root_label defaults to settings.arro_server_root_label
-21. Missing dataset_id yields 422
+18.  Two datasets have independent row indices
+19.  root_label override forwarded to upload_init
+20.  root_label defaults to settings.arro_server_root_label
+21.  Missing dataset_id yields 422
+22.  build_index called even when index_stale=False and is_new=False (issue #26)
+23.  Incremental metadata-only skips build_index
+24.  build_index failure returns 502
 """
 
 from __future__ import annotations
@@ -130,10 +133,9 @@ def test_ingest_arro_sync_called(ingest_client):
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         _post(client, [{"doc_id": "doc0", "text": "hello"}])
 
-    mock_arro.dataset_metadata.assert_called_once_with(dataset_id=DEFAULT_DS)
     mock_arro.upload_init.assert_called_once_with(dataset_id=DEFAULT_DS, root_label="main")
     mock_arro.upload_commit.assert_called_once()
-    mock_arro.build_index.assert_not_called()
+    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS, timeout=600.0)
     assert len(written) == 1
     assert written[0].shape[0] == 1
     assert written[0].dtype == np.float64
@@ -280,7 +282,7 @@ def test_ingest_empty_list_422(ingest_client):
 def test_ingest_arro_server_502_returns_error(ingest_client):
     """If arro-server sync fails, a 502 is returned (store is written first)."""
     client, store, mock_arro = ingest_client
-    mock_arro.dataset_metadata.side_effect = ArroServerError("mocked failure")
+    mock_arro.upload_init.side_effect = ArroServerError("mocked failure")
     mock_open, _ = _zarr_mock()
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         r = _post(client, [{"doc_id": "doc0", "text": "hello"}])
@@ -296,7 +298,7 @@ def test_ingest_arro_server_502_leaves_previous_intact(ingest_client):
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         _post(client, [{"doc_id": "doc0", "text": "hello"}])
     assert store.count(DEFAULT_DS) == 1
-    mock_arro.dataset_metadata.side_effect = ArroServerError("mocked failure")
+    mock_arro.upload_init.side_effect = ArroServerError("mocked failure")
     mock_open2, _ = _zarr_mock()
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open2):
         r = _post(client, [{"doc_id": "doc1", "text": "world"}])
@@ -320,7 +322,7 @@ def test_ingest_build_index_when_stale(ingest_client):
     mock_open, _ = _zarr_mock()
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         _post(client, [{"doc_id": "doc0", "text": "hello"}])
-    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS)
+    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS, timeout=600.0)
 
 
 def test_ingest_build_index_when_new_dataset(ingest_client):
@@ -330,7 +332,79 @@ def test_ingest_build_index_when_new_dataset(ingest_client):
     mock_open, _ = _zarr_mock()
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         _post(client, [{"doc_id": "doc0", "text": "hello"}])
-    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS)
+    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS, timeout=600.0)
+
+
+# ---------------------------------------------------------------------------
+# Issue #26 regression tests — build_index unconditional on full re-ingest
+# ---------------------------------------------------------------------------
+
+
+def test_full_ingest_calls_build_index_when_index_stale_false_is_new_false(
+    ingest_client,
+) -> None:
+    """Issue #26: build_index must be called even when index_stale=False and is_new=False.
+
+    Scenario: volume was wiped (down -v) and re-created. arro-server reports
+    dataset_metadata → exists (is_new=False), upload_commit → index_stale=False.
+    After the fix, build_index is unconditional on full re-ingest.
+    """
+    client, _, mock_arro = ingest_client
+    mock_arro.dataset_metadata.return_value = {"shape": [0, 384]}  # is_new=False
+    mock_arro.upload_commit.return_value = UploadCommitResult(index_stale=False, shape=[0, 384])
+    mock_open, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        _post(client, [{"doc_id": "doc0", "text": "hello"}])
+    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS, timeout=600.0)
+
+
+def test_full_ingest_calls_build_index_when_is_new(ingest_client) -> None:
+    """Non-regression: build_index still called when dataset is brand new (is_new=True)."""
+    client, _, mock_arro = ingest_client
+    mock_arro.dataset_metadata.return_value = None  # is_new=True
+    mock_open, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        _post(client, [{"doc_id": "doc0", "text": "hello"}])
+    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS, timeout=600.0)
+
+
+def test_incremental_ingest_skips_build_index_for_metadata_only(
+    ingest_client,
+) -> None:
+    """Incremental must NOT call build_index for metadata-only batch (issue #26)."""
+    client, store, mock_arro = ingest_client
+
+    # First ingest to populate the store
+    mock_open1, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open1):
+        _post(client, [{"doc_id": "doc0", "text": "existing text"}])
+    mock_arro.build_index.reset_mock()
+
+    # Second ingest with incremental=True, same text → metadata-only
+    mock_open2, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open2):
+        r = client.post(
+            "/ingest",
+            json={
+                "dataset_id": DEFAULT_DS,
+                "documents": [{"doc_id": "doc0", "text": "existing text"}],
+                "incremental": True,
+            },
+        )
+    assert r.status_code == 200
+    mock_arro.build_index.assert_not_called()
+
+
+def test_full_ingest_returns_502_when_build_index_fails(ingest_client) -> None:
+    """If build_index raises ArroServerError, endpoint returns 502 (not 500)."""
+    client, _, mock_arro = ingest_client
+    mock_arro.build_index.side_effect = ArroServerError("build_index timeout")
+    mock_open, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        r = _post(client, [{"doc_id": "doc0", "text": "hello"}])
+    assert r.status_code == 502
+    detail = r.json()["detail"]
+    assert "build_index" in detail
 
 
 # ---------------------------------------------------------------------------
