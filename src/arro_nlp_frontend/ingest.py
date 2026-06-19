@@ -158,6 +158,10 @@ async def _run_incremental_pipeline(
     ------------------------
     1. Consistency guard: server nrows must equal store.next_row_index().
        Raises HTTPException 409 if out of sync.
+       Called whenever new_items OR changed_items is non-empty — both
+       operations depend on row indices being in sync with the server.
+       Metadata-only batches (both lists empty) skip the guard because
+       they perform no vector writes.
     2. append_vectors for new_items (if any). Row indices are derived from
        VectorAppendResult.start_row + offset.
     3. overwrite_vectors for changed_items (if any).
@@ -233,7 +237,7 @@ async def _run_incremental_pipeline(
     try:
         async with lock:
             # 3a. Consistency guard
-            if new_items:
+            if new_items or changed_items:
                 server_count = await arro_client.get_vector_count(request.dataset_id)
                 local_count = store.next_row_index(dataset_id=request.dataset_id)
                 if server_count != local_count:
@@ -493,9 +497,7 @@ async def ingest(
             arr[:] = all_vectors
 
             # 5d. Commit the upload
-            await arro_client.upload_commit(
-                dataset_id=request.dataset_id, fs_path=upload_path
-            )
+            await arro_client.upload_commit(dataset_id=request.dataset_id, fs_path=upload_path)
 
             # 5e. Always rebuild the index on full re-ingest.
             # Index builds on large datasets take several minutes; use a
@@ -505,9 +507,7 @@ async def ingest(
             # is_new=False (dataset metadata exists) even though the physical
             # index is gone.  Calling build_index unconditionally is safe:
             # if the index is already valid, arro-server returns quickly.
-            await arro_client.build_index(
-                dataset_id=request.dataset_id, timeout=600.0
-            )
+            await arro_client.build_index(dataset_id=request.dataset_id, timeout=600.0)
 
         except ArroServerError as exc:
             logger.error(
