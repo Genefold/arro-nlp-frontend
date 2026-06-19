@@ -29,19 +29,13 @@ jobs:
         run: |
           uv sync --frozen --all-extras
 
-      - name: Cache pre-commit hooks
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pre-commit
-          key: pre-commit-3.11-${{ hashFiles('.pre-commit-config.yaml') }}
-
       - name: Run ruff linter
         run: |
-          uv run ruff check src/
+          uv run ruff check src/ tests/
 
       - name: Run ruff formatter check
         run: |
-          uv run ruff format --check src/
+          uv run ruff format --check src/ tests/
 
       - name: Run mypy
         run: |

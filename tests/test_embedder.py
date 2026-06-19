@@ -51,9 +51,9 @@ class TestEmbedderLocal:
         )
         norm_a = float(np.linalg.norm(vecs[0]))
         norm_b = float(np.linalg.norm(vecs[1]))
-        assert (
-            norm_a != norm_b or abs(norm_a - 1.0) > 1e-6
-        ), "Vectors appear to be L2-normalised — check normalize_embeddings=False"
+        assert norm_a != norm_b or abs(norm_a - 1.0) > 1e-6, (
+            "Vectors appear to be L2-normalised — check normalize_embeddings=False"
+        )
 
     def test_deterministic(self, local_embedder):
         text = ["use-after-free in browser renderer"]
