@@ -78,20 +78,18 @@ def mock_arro_client() -> AsyncMock:
     using mock_arro.append_vectors.return_value = VectorAppendResult(...).
     """
     client = AsyncMock(spec=ArroClient)
-    client.dataset_metadata  = AsyncMock(return_value=None)
-    client.upload_init       = AsyncMock(return_value="/tmp/arro_test_upload.zarr")
-    client.upload_commit     = AsyncMock(
+    client.dataset_metadata = AsyncMock(return_value=None)
+    client.upload_init = AsyncMock(return_value="/tmp/arro_test_upload.zarr")
+    client.upload_commit = AsyncMock(
         return_value=UploadCommitResult(index_stale=False, shape=[0, 384])
     )
-    client.build_index       = AsyncMock(return_value=None)
-    client.search            = AsyncMock(return_value=[])
-    client.append_vectors    = AsyncMock(
+    client.build_index = AsyncMock(return_value=None)
+    client.search = AsyncMock(return_value=[])
+    client.append_vectors = AsyncMock(
         return_value=VectorAppendResult(start_row=0, appended=1, new_shape=[1, 384])
     )
-    client.overwrite_vectors = AsyncMock(
-        return_value=VectorOverwriteResult(overwritten=1)
-    )
-    client.get_vector_count  = AsyncMock(return_value=0)
+    client.overwrite_vectors = AsyncMock(return_value=VectorOverwriteResult(overwritten=1))
+    client.get_vector_count = AsyncMock(return_value=0)
     return client
 
 

@@ -37,11 +37,9 @@ Test index
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock
 
 import numpy as np
-import pytest
 
 from arro_nlp_frontend.arro_client import (
     ArroServerError,
@@ -146,14 +144,16 @@ def test_incremental_changed_docs_overwritten(ingest_client):
     """
     client, store, mock_arro = ingest_client
 
-    _seed_store(store, DEFAULT_DS, [
-        {"doc_id": "doc0", "text": "old text zero", "row_index": 0},
-        {"doc_id": "doc1", "text": "old text one",  "row_index": 1},
-    ])
-    mock_arro.get_vector_count = AsyncMock(return_value=2)
-    mock_arro.overwrite_vectors = AsyncMock(
-        return_value=VectorOverwriteResult(overwritten=2)
+    _seed_store(
+        store,
+        DEFAULT_DS,
+        [
+            {"doc_id": "doc0", "text": "old text zero", "row_index": 0},
+            {"doc_id": "doc1", "text": "old text one", "row_index": 1},
+        ],
     )
+    mock_arro.get_vector_count = AsyncMock(return_value=2)
+    mock_arro.overwrite_vectors = AsyncMock(return_value=VectorOverwriteResult(overwritten=2))
 
     r = _post_incremental(
         client,
@@ -195,9 +195,13 @@ def test_incremental_metadata_only_no_embed_no_vector_write(ingest_client):
 
     client, store, mock_arro = ingest_client
 
-    _seed_store(store, DEFAULT_DS, [
-        {"doc_id": "doc0", "text": "unchanged text", "row_index": 0},
-    ])
+    _seed_store(
+        store,
+        DEFAULT_DS,
+        [
+            {"doc_id": "doc0", "text": "unchanged text", "row_index": 0},
+        ],
+    )
 
     embedder = client.app.state.embedder
     with patch.object(embedder, "encode_batch", wraps=embedder.encode_batch) as mock_encode:
@@ -229,24 +233,26 @@ def test_incremental_build_index_called_once_for_mixed_batch(ingest_client):
     """Mixed batch (new + changed + metadata-only) -> build_index called exactly once."""
     client, store, mock_arro = ingest_client
 
-    _seed_store(store, DEFAULT_DS, [
-        {"doc_id": "changed", "text": "old text",       "row_index": 0},
-        {"doc_id": "meta",    "text": "unchanged text",  "row_index": 1},
-    ])
+    _seed_store(
+        store,
+        DEFAULT_DS,
+        [
+            {"doc_id": "changed", "text": "old text", "row_index": 0},
+            {"doc_id": "meta", "text": "unchanged text", "row_index": 1},
+        ],
+    )
     mock_arro.get_vector_count = AsyncMock(return_value=2)
     mock_arro.append_vectors = AsyncMock(
         return_value=VectorAppendResult(start_row=2, appended=1, new_shape=[3, 384])
     )
-    mock_arro.overwrite_vectors = AsyncMock(
-        return_value=VectorOverwriteResult(overwritten=1)
-    )
+    mock_arro.overwrite_vectors = AsyncMock(return_value=VectorOverwriteResult(overwritten=1))
 
     r = _post_incremental(
         client,
         [
-            {"doc_id": "new",     "text": "brand new text"},
+            {"doc_id": "new", "text": "brand new text"},
             {"doc_id": "changed", "text": "new text"},
-            {"doc_id": "meta",    "text": "unchanged text"},
+            {"doc_id": "meta", "text": "unchanged text"},
         ],
     )
     assert r.status_code == 200, r.json()
@@ -262,9 +268,13 @@ def test_incremental_build_index_not_called_for_metadata_only(ingest_client):
     """All metadata-only -> build_index NOT called (no vector changes)."""
     client, store, mock_arro = ingest_client
 
-    _seed_store(store, DEFAULT_DS, [
-        {"doc_id": "doc0", "text": "same text", "row_index": 0},
-    ])
+    _seed_store(
+        store,
+        DEFAULT_DS,
+        [
+            {"doc_id": "doc0", "text": "same text", "row_index": 0},
+        ],
+    )
 
     r = _post_incremental(
         client,
@@ -308,17 +318,19 @@ def test_incremental_response_order_matches_request_order(ingest_client):
     """Response results are in request order regardless of classification."""
     client, store, mock_arro = ingest_client
 
-    _seed_store(store, DEFAULT_DS, [
-        {"doc_id": "b", "text": "old b", "row_index": 0},
-        {"doc_id": "c", "text": "same c", "row_index": 1},
-    ])
+    _seed_store(
+        store,
+        DEFAULT_DS,
+        [
+            {"doc_id": "b", "text": "old b", "row_index": 0},
+            {"doc_id": "c", "text": "same c", "row_index": 1},
+        ],
+    )
     mock_arro.get_vector_count = AsyncMock(return_value=2)
     mock_arro.append_vectors = AsyncMock(
         return_value=VectorAppendResult(start_row=2, appended=1, new_shape=[3, 384])
     )
-    mock_arro.overwrite_vectors = AsyncMock(
-        return_value=VectorOverwriteResult(overwritten=1)
-    )
+    mock_arro.overwrite_vectors = AsyncMock(return_value=VectorOverwriteResult(overwritten=1))
 
     # Request order: new(a), changed(b), metadata(c)
     r = _post_incremental(
@@ -345,9 +357,13 @@ def test_incremental_status_skipped_for_metadata_only(ingest_client):
     """metadata-only docs return status='skipped'."""
     client, store, mock_arro = ingest_client
 
-    _seed_store(store, DEFAULT_DS, [
-        {"doc_id": "doc0", "text": "exact same text", "row_index": 0},
-    ])
+    _seed_store(
+        store,
+        DEFAULT_DS,
+        [
+            {"doc_id": "doc0", "text": "exact same text", "row_index": 0},
+        ],
+    )
 
     r = _post_incremental(
         client,
@@ -419,3 +435,173 @@ def test_incremental_arro_server_error_returns_502(ingest_client):
     # Store must not have been written (error occurred inside the lock,
     # before upsert_batch_with_indices was called).
     assert store.count(DEFAULT_DS) == 0
+
+
+# ---------------------------------------------------------------------------
+# 12. Consistency guard triggered by changed_items-only batch
+# ---------------------------------------------------------------------------
+
+
+def test_incremental_consistency_guard_triggers_for_changed_items_only(ingest_client):
+    """Regression test for issue #24.
+
+    A batch with ONLY changed documents (new_items is empty) must still
+    trigger the consistency guard. Before the fix, the guard was gated on
+    ``if new_items:``, leaving changed-only batches unprotected.
+
+    Setup:
+    - Store has 1 document (row_index=0).
+    - Server reports 5 rows (diverged from store).
+    - Batch: the same doc_id with changed text.
+
+    Expected:
+    - 409 raised before overwrite_vectors is called.
+    - store still has the old document text (no write occurred).
+    """
+    client, store, mock_arro = ingest_client
+
+    _seed_store(
+        store,
+        DEFAULT_DS,
+        [
+            {"doc_id": "existing_doc", "text": "original text", "row_index": 0},
+        ],
+    )
+
+    mock_arro.get_vector_count = AsyncMock(return_value=5)
+
+    r = _post_incremental(
+        client,
+        [{"doc_id": "existing_doc", "text": "changed text"}],
+    )
+
+    assert r.status_code == 409, r.json()
+    assert "consistency error" in r.json()["detail"].lower()
+
+    mock_arro.overwrite_vectors.assert_not_called()
+
+    doc = store.get_by_id(DEFAULT_DS, "existing_doc")
+    assert doc is not None
+    assert doc.text == "original text"
+
+
+# ---------------------------------------------------------------------------
+# 13. Consistency guard NOT triggered for metadata-only batch
+# ---------------------------------------------------------------------------
+
+
+def test_incremental_consistency_guard_not_triggered_for_metadata_only(ingest_client):
+    """Metadata-only batches skip the consistency guard (no vector writes).
+
+    The guard is only needed when row indices are used for writes.
+    Metadata-only docs perform no vector writes, so the guard is
+    correctly skipped even if server count diverges.
+
+    This test documents the intentional behaviour and prevents future
+    regressions that would make metadata-only batches fail with 409
+    spuriously.
+    """
+    client, store, mock_arro = ingest_client
+
+    _seed_store(
+        store,
+        DEFAULT_DS,
+        [
+            {"doc_id": "doc_meta", "text": "same text", "row_index": 0},
+        ],
+    )
+
+    mock_arro.get_vector_count = AsyncMock(return_value=99)
+
+    r = _post_incremental(
+        client,
+        [{"doc_id": "doc_meta", "text": "same text", "metadata": {"k": "v"}}],
+    )
+
+    assert r.status_code == 200, r.json()
+    assert r.json()["results"][0]["status"] == "skipped"
+
+    mock_arro.get_vector_count.assert_not_called()
+
+    doc = store.get_by_id(DEFAULT_DS, "doc_meta")
+    assert doc is not None
+    assert doc.metadata == {"k": "v"}
+
+
+# ---------------------------------------------------------------------------
+# 14. Consistency guard triggered for mixed batch (changed + metadata)
+# ---------------------------------------------------------------------------
+
+
+def test_incremental_consistency_guard_triggers_for_mixed_changed_and_metadata(ingest_client):
+    """Mixed batch with changed + metadata-only docs must trigger the guard.
+
+    If server is out of sync, the 409 must fire before any write,
+    even when new_items is empty (only changed_items + metadata_items).
+    """
+    client, store, mock_arro = ingest_client
+
+    _seed_store(
+        store,
+        DEFAULT_DS,
+        [
+            {"doc_id": "will_change", "text": "old text", "row_index": 0},
+            {"doc_id": "stays_same", "text": "same text", "row_index": 1},
+        ],
+    )
+
+    mock_arro.get_vector_count = AsyncMock(return_value=99)
+
+    r = _post_incremental(
+        client,
+        [
+            {"doc_id": "will_change", "text": "new text"},
+            {"doc_id": "stays_same", "text": "same text"},
+        ],
+    )
+
+    assert r.status_code == 409, r.json()
+    mock_arro.overwrite_vectors.assert_not_called()
+    mock_arro.append_vectors.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 15. Changed-only batch succeeds when server is in sync
+# ---------------------------------------------------------------------------
+
+
+def test_incremental_changed_only_succeeds_when_server_in_sync(ingest_client):
+    """Changed-only batch completes normally when server count matches store.
+
+    This is the happy-path companion to test #12: the guard fires on
+    mismatch, but must NOT block the request when counts are correct.
+    """
+    client, store, mock_arro = ingest_client
+
+    _seed_store(
+        store,
+        DEFAULT_DS,
+        [
+            {"doc_id": "doc0", "text": "old text zero", "row_index": 0},
+            {"doc_id": "doc1", "text": "old text one", "row_index": 1},
+        ],
+    )
+
+    mock_arro.get_vector_count = AsyncMock(return_value=2)
+    mock_arro.overwrite_vectors = AsyncMock(return_value=VectorOverwriteResult(overwritten=2))
+
+    r = _post_incremental(
+        client,
+        [
+            {"doc_id": "doc0", "text": "new text zero"},
+            {"doc_id": "doc1", "text": "new text one"},
+        ],
+    )
+
+    assert r.status_code == 200, r.json()
+    results = r.json()["results"]
+    assert results[0]["status"] == "updated"
+    assert results[1]["status"] == "updated"
+
+    mock_arro.overwrite_vectors.assert_called_once()
+    mock_arro.append_vectors.assert_not_called()
