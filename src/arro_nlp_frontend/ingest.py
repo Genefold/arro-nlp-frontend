@@ -497,9 +497,7 @@ async def ingest(
             arr[:] = all_vectors
 
             # 5d. Commit the upload
-            await arro_client.upload_commit(
-                dataset_id=request.dataset_id, fs_path=upload_path
-            )
+            await arro_client.upload_commit(dataset_id=request.dataset_id, fs_path=upload_path)
 
             # 5e. Always rebuild the index on full re-ingest.
             # Index builds on large datasets take several minutes; use a
@@ -509,9 +507,7 @@ async def ingest(
             # is_new=False (dataset metadata exists) even though the physical
             # index is gone.  Calling build_index unconditionally is safe:
             # if the index is already valid, arro-server returns quickly.
-            await arro_client.build_index(
-                dataset_id=request.dataset_id, timeout=600.0
-            )
+            await arro_client.build_index(dataset_id=request.dataset_id, timeout=600.0)
 
         except ArroServerError as exc:
             logger.error(
