@@ -37,6 +37,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import numpy as np
+import pytest
 
 from arro_nlp_frontend.arro_client import ArroClient, ArroServerError, UploadCommitResult
 from arro_nlp_frontend.embedder import Embedder
@@ -101,10 +102,19 @@ def test_ingest_batch_row_indices_contiguous(ingest_client):
 
 
 def test_ingest_status_created_vs_updated(ingest_client):
-    client, _, _ = ingest_client
+    client, _, mock_arro = ingest_client
     r1 = _post(client, [{"doc_id": "doc0", "text": "hello"}])
     assert r1.json()["results"][0]["status"] == "created"
-    r2 = _post(client, [{"doc_id": "doc0", "text": "updated text"}])
+    mock_arro.get_vector_count = AsyncMock(return_value=1)
+    r2 = client.post(
+        "/ingest",
+        json={
+            "dataset_id": DEFAULT_DS,
+            "documents": [{"doc_id": "doc0", "text": "updated text"}],
+            "incremental": True,
+        },
+    )
+    assert r2.status_code == 200, f"r2={r2.text}"
     assert r2.json()["results"][0]["status"] == "updated"
 
 
@@ -734,3 +744,56 @@ def test_full_ingest_rollback_is_idempotent_if_row_already_absent(
     _, store, _ = ingest_client
     result = store.rollback_rows(DEFAULT_DS, [0, 1, 2])
     assert result == 0
+
+
+@pytest.mark.asyncio
+async def test_ingest_full_rewrite_409_on_existing_doc_id(ingest_client) -> None:
+    client, store, _ = ingest_client
+    mock_open, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        r1 = _post(client, [{"doc_id": "doc-1", "text": "hello"}])
+    assert r1.status_code == 200
+
+    mock_open2, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open2):
+        r2 = _post(client, [{"doc_id": "doc-1", "text": "hello again"}])
+    assert r2.status_code == 409
+    detail = r2.json()["detail"]
+    assert "doc-1" in detail
+    assert "incremental=True" in detail
+    doc = store.get_by_id(DEFAULT_DS, "doc-1")
+    assert doc is not None
+    assert doc.row_index == 0
+
+
+@pytest.mark.asyncio
+async def test_ingest_incremental_not_blocked_by_409_guard(ingest_client) -> None:
+    client, store, mock_arro = ingest_client
+    mock_open, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        r1 = _post(client, [{"doc_id": "doc-2", "text": "original"}])
+    assert r1.status_code == 200
+
+    mock_arro.get_vector_count = AsyncMock(return_value=1)
+
+    mock_open2, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open2):
+        r2 = client.post(
+            "/ingest",
+            json={
+                "dataset_id": DEFAULT_DS,
+                "documents": [{"doc_id": "doc-2", "text": "updated"}],
+                "incremental": True,
+            },
+        )
+    assert r2.status_code == 200
+    assert r2.json()["results"][0]["status"] == "updated"
+
+
+@pytest.mark.asyncio
+async def test_ingest_full_rewrite_first_ingest_not_blocked(ingest_client) -> None:
+    client, _, _ = ingest_client
+    mock_open, _ = _zarr_mock()
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        r = _post(client, [{"doc_id": "new-doc", "text": "hello"}])
+    assert r.status_code == 200

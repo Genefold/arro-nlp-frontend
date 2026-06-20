@@ -302,3 +302,34 @@ def test_store_migration_v1_raises_runtime_error(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="version-1"):
         DocumentStore(db_path)
+
+
+def test_get_existing_ids_returns_matching_ids(tmp_path: Path) -> None:
+    store = DocumentStore(tmp_path / "db.sqlite")
+    vecs = np.ones((2, 4), dtype=np.float64)
+    docs = [
+        Document(row_index=0, doc_id="a", text="alpha", metadata={}, ingested_at=None),
+        Document(row_index=1, doc_id="b", text="beta", metadata={}, ingested_at=None),
+    ]
+    store.upsert_batch_with_indices("ds", docs, vecs)
+    result = store.get_existing_ids("ds", ["a", "b", "c"])
+    assert result == {"a", "b"}
+
+
+def test_get_existing_ids_empty_input(tmp_path: Path) -> None:
+    store = DocumentStore(tmp_path / "db.sqlite")
+    assert store.get_existing_ids("ds", []) == set()
+
+
+def test_get_existing_ids_no_match(tmp_path: Path) -> None:
+    store = DocumentStore(tmp_path / "db.sqlite")
+    assert store.get_existing_ids("ds", ["x", "y"]) == set()
+
+
+def test_get_existing_ids_dataset_isolation(tmp_path: Path) -> None:
+    store = DocumentStore(tmp_path / "db.sqlite")
+    vecs = np.ones((1, 4), dtype=np.float64)
+    doc = Document(row_index=0, doc_id="a", text="alpha", metadata={}, ingested_at=None)
+    store.upsert_batch_with_indices("ds-1", [doc], vecs)
+    result = store.get_existing_ids("ds-2", ["a"])
+    assert result == set()
