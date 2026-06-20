@@ -26,6 +26,43 @@ from arro_nlp_frontend.store import DocumentStore
 logger = logging.getLogger(__name__)
 
 
+def _check_single_worker() -> None:
+    """Warn loudly if the process appears to be running in multi-worker mode.
+
+    arro-nlp-frontend uses a process-local asyncio.Lock for ingest
+    serialisation. Running with multiple uvicorn worker processes (--workers N
+    or WEB_CONCURRENCY > 1) will cause concurrent workers to compute the same
+    next_row_index(), silently corrupting the SQLite document store and the
+    Zarr vector array on arro-server.
+
+    This function checks two signals:
+    - The ``WEB_CONCURRENCY`` environment variable (set by platforms such as
+      Railway, Fly.io, and Render based on CPU count).
+    - The ``UVICORN_WORKERS`` environment variable (used by some deployment
+      configurations).
+
+    A CRITICAL log is emitted when either variable is set to a value other
+    than "1". The application is NOT hard-crashed because the guard must also
+    work correctly in test environments where those env vars may be set for
+    unrelated reasons. Platform operators are responsible for ensuring
+    WEB_CONCURRENCY=1.
+    """
+    import os
+
+    for env_var in ("WEB_CONCURRENCY", "UVICORN_WORKERS"):
+        value = os.environ.get(env_var, "1")
+        if value != "1":
+            logger.critical(
+                "[startup] %s=%s detected. arro-nlp-frontend does NOT support "
+                "multi-worker mode. The per-dataset asyncio.Lock is process-local "
+                "and WILL NOT prevent row index corruption across workers. "
+                "Set %s=1 to suppress this warning.",
+                env_var,
+                value,
+                env_var,
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application startup and shutdown.
@@ -37,10 +74,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     Startup sequence
     ----------------
     1. ArroClient created (before try — ensures aclose() is always called).
-    2. Embedder.from_settings() — loads the sentence-transformer or OpenAI backend.
-    3. DocumentStore(...) — opens SQLite, applies schema, detects v1 migration need.
-    4. ingest_locks dict initialised.
-    5. Startup health probe against arro-server (non-fatal on failure).
+    2. Multi-worker guard (_check_single_worker) — logs CRITICAL if WEB_CONCURRENCY
+       or UVICORN_WORKERS > 1 (first statement inside try).
+    3. Embedder.from_settings() — loads the sentence-transformer or OpenAI backend.
+    4. DocumentStore(...) — opens SQLite, applies schema, detects v1 migration need.
+    5. ingest_locks dict initialised.
+    6. Startup health probe against arro-server (non-fatal on failure).
 
     Shutdown sequence (finally)
     ---------------------------
@@ -49,6 +88,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
     arro_client = ArroClient(base_url=settings.arro_server_url)
     try:
+        _check_single_worker()
         app.state.embedder = Embedder.from_settings()
         app.state.store = DocumentStore(Path(settings.store_db_path))
         app.state.ingest_locks = {}
@@ -105,7 +145,12 @@ def create_app() -> FastAPI:
 
 
 def run() -> None:
-    """Entry point for `arro-nlp-frontend` CLI command."""
+    """Entry point for `arro-nlp-frontend` CLI command.
+
+    workers is hard-coded to 1. arro-nlp-frontend uses a process-local
+    asyncio.Lock for ingest serialisation; multi-worker mode would silently
+    corrupt row indices. See issue #27.
+    """
     uvicorn.run(
         "arro_nlp_frontend.main:create_app",
         factory=True,
@@ -113,6 +158,7 @@ def run() -> None:
         port=settings.port,
         log_level="info",
         reload=False,
+        workers=1,
     )
 
 

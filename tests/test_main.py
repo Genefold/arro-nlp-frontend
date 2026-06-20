@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from arro_nlp_frontend.arro_client import ArroClient
-from arro_nlp_frontend.main import create_app, lifespan
+from arro_nlp_frontend.main import _check_single_worker, create_app, lifespan
 
 
 def test_health_endpoint(app_client):
@@ -113,3 +115,60 @@ async def test_lifespan_arro_client_closed_on_embedder_failure():
 
         assert mock_aclose.call_count == 1
         assert mock_close.call_count == 0
+
+
+def test_check_single_worker_no_warning_when_absent(caplog):
+    """No CRITICAL log when WEB_CONCURRENCY and UVICORN_WORKERS are not set."""
+    with (
+        patch.dict(os.environ, {"WEB_CONCURRENCY": "1", "UVICORN_WORKERS": "1"}),
+        caplog.at_level(logging.CRITICAL, logger="arro_nlp_frontend.main"),
+    ):
+        _check_single_worker()
+    assert not any(r.levelname == "CRITICAL" for r in caplog.records)
+
+
+def test_check_single_worker_critical_on_web_concurrency(caplog):
+    """CRITICAL is logged when WEB_CONCURRENCY is set to a value other than '1'."""
+    with (
+        patch.dict(os.environ, {"WEB_CONCURRENCY": "2"}, clear=True),
+        caplog.at_level(logging.CRITICAL, logger="arro_nlp_frontend.main"),
+    ):
+        _check_single_worker()
+    criticals = [r for r in caplog.records if r.levelname == "CRITICAL"]
+    assert len(criticals) == 1
+    assert "WEB_CONCURRENCY" in criticals[0].message
+    assert "2" in criticals[0].message
+
+
+def test_check_single_worker_critical_on_uvicorn_workers(caplog):
+    """CRITICAL is logged when UVICORN_WORKERS is set to a value other than '1'."""
+    with (
+        patch.dict(os.environ, {"UVICORN_WORKERS": "4"}, clear=True),
+        caplog.at_level(logging.CRITICAL, logger="arro_nlp_frontend.main"),
+    ):
+        _check_single_worker()
+    criticals = [r for r in caplog.records if r.levelname == "CRITICAL"]
+    assert len(criticals) == 1
+    assert "UVICORN_WORKERS" in criticals[0].message
+    assert "4" in criticals[0].message
+
+
+def test_check_single_worker_no_warning_when_set_to_one(caplog):
+    """No CRITICAL log when WEB_CONCURRENCY is explicitly set to '1'."""
+    with (
+        patch.dict(os.environ, {"WEB_CONCURRENCY": "1", "UVICORN_WORKERS": "1"}),
+        caplog.at_level(logging.CRITICAL, logger="arro_nlp_frontend.main"),
+    ):
+        _check_single_worker()
+    assert not any(r.levelname == "CRITICAL" for r in caplog.records)
+
+
+def test_check_single_worker_critical_for_both_vars(caplog):
+    """Two CRITICAL logs emitted when both WEB_CONCURRENCY and UVICORN_WORKERS are > 1."""
+    with (
+        patch.dict(os.environ, {"WEB_CONCURRENCY": "2", "UVICORN_WORKERS": "2"}, clear=True),
+        caplog.at_level(logging.CRITICAL, logger="arro_nlp_frontend.main"),
+    ):
+        _check_single_worker()
+    criticals = [r for r in caplog.records if r.levelname == "CRITICAL"]
+    assert len(criticals) == 2
