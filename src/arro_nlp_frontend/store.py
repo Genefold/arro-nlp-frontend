@@ -383,7 +383,7 @@ class DocumentStore:
 
         Parameters
         ----------
-        dataset_id:  Dataset identifier (e.g. \"cve/embeddings\").
+        dataset_id:  Dataset identifier (e.g. "cve/embeddings").
         row_indices: List of row_index values to delete. Empty list is a no-op.
 
         Returns
