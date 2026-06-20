@@ -30,40 +30,53 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application startup and shutdown.
 
-    On startup: initialises Embedder, DocumentStore, ArroClient, and the
-    per-dataset asyncio.Lock registry used to serialise concurrent ingest
-    operations within the same dataset. Logs embedder config and performs
-    a consistency check between the arro-server dataset shape
-    and the local document store row count.
+    ArroClient is instantiated before the try block so its underlying
+    httpx.AsyncClient is always closed in the finally block, regardless of
+    whether downstream startup steps (Embedder, DocumentStore) raise.
 
-    On shutdown: closes the ArroClient httpx session and the SQLite connection.
+    Startup sequence
+    ----------------
+    1. ArroClient created (before try — ensures aclose() is always called).
+    2. Embedder.from_settings() — loads the sentence-transformer or OpenAI backend.
+    3. DocumentStore(...) — opens SQLite, applies schema, detects v1 migration need.
+    4. ingest_locks dict initialised.
+    5. Startup health probe against arro-server (non-fatal on failure).
+
+    Shutdown sequence (finally)
+    ---------------------------
+    - arro_client.aclose() — always executed.
+    - app.state.store.close() — only if DocumentStore was successfully assigned.
     """
-    app.state.embedder = Embedder.from_settings()
-    app.state.store = DocumentStore(Path(settings.store_db_path))
-    app.state.ingest_locks = {}
-    app.state.arro_client = ArroClient(base_url=settings.arro_server_url)
-
-    logger.info(
-        "Loading embedder: backend=%s model=%s path=%r scale=%s",
-        settings.embed_backend,
-        settings.embed_model,
-        settings.embedder_model_path or "(HF Hub)",
-        settings.embed_scale_factor,
-    )
-    logger.info("Embedder ready. dim=%d", app.state.embedder.dim)
-
+    arro_client = ArroClient(base_url=settings.arro_server_url)
     try:
-        await app.state.arro_client._client.get("/health", timeout=3.0)
-        logger.info("[startup] arro-server is reachable.")
-    except httpx.RequestError:
-        logger.warning(
-            "[startup] Could not reach arro-server. Search will fail until it is available."
+        app.state.embedder = Embedder.from_settings()
+        app.state.store = DocumentStore(Path(settings.store_db_path))
+        app.state.ingest_locks = {}
+        app.state.arro_client = arro_client
+
+        logger.info(
+            "Loading embedder: backend=%s model=%s path=%r scale=%s",
+            settings.embed_backend,
+            settings.embed_model,
+            settings.embedder_model_path or "(HF Hub)",
+            settings.embed_scale_factor,
         )
+        logger.info("Embedder ready. dim=%d", app.state.embedder.dim)
 
-    yield
+        try:
+            await arro_client._client.get("/health", timeout=3.0)
+            logger.info("[startup] arro-server is reachable.")
+        except httpx.RequestError:
+            logger.warning(
+                "[startup] Could not reach arro-server. Search will fail until it is available."
+            )
 
-    await app.state.arro_client.aclose()
-    app.state.store.close()
+        yield
+
+    finally:
+        await arro_client.aclose()
+        if hasattr(app.state, "store"):
+            app.state.store.close()
 
 
 def create_app() -> FastAPI:
