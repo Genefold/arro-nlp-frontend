@@ -370,15 +370,35 @@ class DocumentStore:
         return cursor.rowcount > 0
 
     def rollback_rows(self, dataset_id: str, row_indices: list[int]) -> int:
+        """Delete rows by their row_index values, reversing a partial write.
+
+        Called by the ingest endpoint when arro-server sync fails before
+        upload_commit. Removes all rows written in the current batch so that
+        next_row_index() returns the pre-ingest value and the next call gets
+        the same start_row without creating gaps.
+
+        Safe to call when row_indices are already absent (idempotent, returns 0).
+        Must NOT be called after upload_commit succeeds -- at that point vectors
+        are on arro-server and removing SQLite rows would corrupt the dataset.
+
+        Parameters
+        ----------
+        dataset_id:  Dataset identifier (e.g. \"cve/embeddings\").
+        row_indices: List of row_index values to delete. Empty list is a no-op.
+
+        Returns
+        -------
+        Number of rows actually deleted (0 if all were already absent).
+        """
         if not row_indices:
             return 0
         assert self._conn is not None
         placeholders = ",".join("?" * len(row_indices))
-        cur = self._conn.execute(
-            f"DELETE FROM documents WHERE dataset_id = ? AND row_index IN ({placeholders})",
-            [dataset_id, *row_indices],
-        )
-        self._conn.commit()
+        with self._conn:
+            cur = self._conn.execute(
+                f"DELETE FROM documents WHERE dataset_id = ? AND row_index IN ({placeholders})",
+                [dataset_id, *row_indices],
+            )
         return cur.rowcount
 
     def next_row_index(self, dataset_id: str) -> int:

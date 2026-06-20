@@ -15,6 +15,7 @@ from typing import Literal
 import numpy as np
 import zarr
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from arro_nlp_frontend.arro_client import ArroClient, ArroServerError, VectorAppendResult
@@ -533,8 +534,6 @@ async def ingest(
                     rolled_back_count,
                     exc,
                 )
-                from fastapi.responses import JSONResponse
-
                 return JSONResponse(
                     status_code=502,
                     headers={"X-Partial-Write": "rolled-back"},
@@ -558,8 +557,6 @@ async def ingest(
                     start_row,
                     exc,
                 )
-                from fastapi.responses import JSONResponse
-
                 return JSONResponse(
                     status_code=502,
                     headers={"X-Partial-Write": "committed-index-stale"},
