@@ -350,6 +350,17 @@ class DocumentStore:
         row = cursor.fetchone()
         return self._row_to_document(row) if row else None
 
+    def get_existing_ids(self, dataset_id: str, doc_ids: list[str]) -> set[str]:
+        if not doc_ids:
+            return set()
+        assert self._conn is not None
+        placeholders = ",".join("?" * len(doc_ids))
+        cursor = self._conn.execute(
+            f"SELECT doc_id FROM documents WHERE dataset_id = ? AND doc_id IN ({placeholders})",
+            [dataset_id, *doc_ids],
+        )
+        return {row[0] for row in cursor.fetchall()}
+
     def delete_by_id(self, dataset_id: str, doc_id: str) -> bool:
         """Delete the document with doc_id from the given dataset.
 

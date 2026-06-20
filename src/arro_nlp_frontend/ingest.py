@@ -440,6 +440,20 @@ async def ingest(
             detail=f"Duplicate doc_ids in request: {duplicates}",
         )
 
+    # Guard against ghost-row creation on full-rewrite pipeline.
+    if not request.incremental:
+        existing_ids = store.get_existing_ids(request.dataset_id, doc_ids)
+        if existing_ids:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"doc_ids already exist in dataset '{request.dataset_id}': "
+                    f"{sorted(existing_ids)}. "
+                    "Use incremental=True to update documents in place, or "
+                    "DELETE the documents before re-ingesting with the full pipeline."
+                ),
+            )
+
     # Step 2 -- Route to incremental pipeline if requested
     if request.incremental:
         return await _run_incremental_pipeline(
