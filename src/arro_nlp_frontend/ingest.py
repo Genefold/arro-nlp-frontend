@@ -384,7 +384,7 @@ async def _run_incremental_pipeline(
 async def ingest(
     request: IngestRequest,
     req: Request,
-) -> IngestResponse:
+) -> IngestResponse | JSONResponse:
     """Ingest documents: embed -> store in SQLite -> Zarr rewrite -> index.
 
     SINGLE-PROCESS GUARANTEE ONLY.
