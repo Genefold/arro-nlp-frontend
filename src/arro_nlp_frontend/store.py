@@ -369,6 +369,18 @@ class DocumentStore:
         self._conn.commit()
         return cursor.rowcount > 0
 
+    def rollback_rows(self, dataset_id: str, row_indices: list[int]) -> int:
+        if not row_indices:
+            return 0
+        assert self._conn is not None
+        placeholders = ",".join("?" * len(row_indices))
+        cur = self._conn.execute(
+            f"DELETE FROM documents WHERE dataset_id = ? AND row_index IN ({placeholders})",
+            [dataset_id, *row_indices],
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     def next_row_index(self, dataset_id: str) -> int:
         """Return the next available row index as MAX(row_index) + 1 for the dataset.
 

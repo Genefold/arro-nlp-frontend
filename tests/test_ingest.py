@@ -280,32 +280,33 @@ def test_ingest_empty_list_422(ingest_client):
 
 
 def test_ingest_arro_server_502_returns_error(ingest_client):
-    """If arro-server sync fails, a 502 is returned (store is written first)."""
+    """If arro-server sync fails pre-commit, 502 is returned and SQLite is rolled back."""
     client, store, mock_arro = ingest_client
     mock_arro.upload_init.side_effect = ArroServerError("mocked failure")
     mock_open, _ = _zarr_mock()
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         r = _post(client, [{"doc_id": "doc0", "text": "hello"}])
     assert r.status_code == 502
-    assert store.count(DEFAULT_DS) == 1
-    assert store.get_by_id(DEFAULT_DS, "doc0") is not None
+    assert store.count(DEFAULT_DS) == 0
 
 
 def test_ingest_arro_server_502_leaves_previous_intact(ingest_client):
-    """A failed sync after a successful one leaves all local docs intact."""
+    """A failed sync after a successful one leaves the FIRST batch intact,
+    but rolls back the SECOND (failed) batch."""
     client, store, mock_arro = ingest_client
     mock_open, _ = _zarr_mock()
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
         _post(client, [{"doc_id": "doc0", "text": "hello"}])
     assert store.count(DEFAULT_DS) == 1
+
     mock_arro.upload_init.side_effect = ArroServerError("mocked failure")
     mock_open2, _ = _zarr_mock()
     with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open2):
         r = _post(client, [{"doc_id": "doc1", "text": "world"}])
     assert r.status_code == 502
-    assert store.count(DEFAULT_DS) == 2
+    assert store.count(DEFAULT_DS) == 1
     assert store.get_by_id(DEFAULT_DS, "doc0") is not None
-    assert store.get_by_id(DEFAULT_DS, "doc1") is not None
+    assert store.get_by_id(DEFAULT_DS, "doc1") is None
 
 
 # ---------------------------------------------------------------------------
@@ -588,3 +589,148 @@ def test_ingest_concurrent_batches_same_dataset_still_serialised(
         assert all_indices == [0, 1, 2], f"Row index collision: {all_indices}"
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Issue #25 regression tests — partial-write rollback on full-rewrite path
+# ---------------------------------------------------------------------------
+
+
+def test_full_ingest_pre_commit_failure_rolls_back_sqlite(ingest_client) -> None:
+    """Issue #25: if upload_commit fails, SQLite must be rolled back.
+
+    After the failure, store.count() must return the pre-ingest value (0).
+    next_row_index() must also return 0, so the next call gets start_row=0
+    and not start_row=N (which would create a gap in arro-server).
+    """
+    client, store, mock_arro = ingest_client
+    mock_arro.upload_commit.side_effect = ArroServerError("network error")
+    mock_open, _ = _zarr_mock()
+
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        r = _post(client, [{"doc_id": "doc0", "text": "hello"}])
+
+    assert r.status_code == 502
+    assert r.headers.get("X-Partial-Write") == "rolled-back"
+    assert store.count(DEFAULT_DS) == 0  # rolled back
+    assert store.next_row_index(DEFAULT_DS) == 0  # safe to re-ingest
+
+
+def test_full_ingest_pre_commit_failure_upload_init_rolls_back_sqlite(
+    ingest_client,
+) -> None:
+    """Issue #25: rollback also works when upload_init (not upload_commit) fails."""
+    client, store, mock_arro = ingest_client
+    mock_arro.upload_init.side_effect = ArroServerError("connection refused")
+    mock_open, _ = _zarr_mock()
+
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        r = _post(client, [{"doc_id": "doc0", "text": "hello"}])
+
+    assert r.status_code == 502
+    assert r.headers.get("X-Partial-Write") == "rolled-back"
+    assert store.count(DEFAULT_DS) == 0
+    assert store.next_row_index(DEFAULT_DS) == 0
+
+
+def test_full_ingest_post_commit_build_index_failure_does_not_rollback(
+    ingest_client,
+) -> None:
+    """Issue #25: if build_index fails AFTER upload_commit, SQLite must NOT be rolled back.
+
+    Vectors are already on arro-server. Rolling back SQLite would corrupt the
+    dataset (SQLite would say 0 rows, arro-server has N vectors). The header
+    must be 'committed-index-stale', not 'rolled-back'.
+    """
+    client, store, mock_arro = ingest_client
+    mock_arro.build_index.side_effect = ArroServerError("build_index timeout")
+    mock_open, _ = _zarr_mock()
+
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        r = _post(client, [{"doc_id": "doc0", "text": "hello"}])
+
+    assert r.status_code == 502
+    assert r.headers.get("X-Partial-Write") == "committed-index-stale"
+    # SQLite must be intact — vectors are on arro-server
+    assert store.count(DEFAULT_DS) == 1
+    assert store.get_by_id(DEFAULT_DS, "doc0") is not None
+    assert store.next_row_index(DEFAULT_DS) == 1  # no rollback
+
+
+def test_full_ingest_pre_commit_failure_batch_of_three_rolls_back_all(
+    ingest_client,
+) -> None:
+    """Issue #25: rollback removes ALL N rows, not just the first."""
+    client, store, mock_arro = ingest_client
+    mock_arro.upload_commit.side_effect = ArroServerError("timeout")
+    mock_open, _ = _zarr_mock()
+
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        r = _post(
+            client,
+            [
+                {"doc_id": "d0", "text": "a"},
+                {"doc_id": "d1", "text": "b"},
+                {"doc_id": "d2", "text": "c"},
+            ],
+        )
+
+    assert r.status_code == 502
+    assert r.headers.get("X-Partial-Write") == "rolled-back"
+    assert store.count(DEFAULT_DS) == 0
+    assert store.next_row_index(DEFAULT_DS) == 0
+
+
+def test_full_ingest_rollback_does_not_affect_previous_successful_rows(
+    ingest_client,
+) -> None:
+    """Issue #25: rollback of batch N does not touch rows from batch N-1."""
+    client, store, mock_arro = ingest_client
+    mock_open, _ = _zarr_mock()
+
+    # First batch succeeds
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        r1 = _post(client, [{"doc_id": "doc0", "text": "first"}])
+    assert r1.status_code == 200
+    assert store.count(DEFAULT_DS) == 1
+
+    # Second batch fails pre-commit
+    mock_arro.upload_commit.side_effect = ArroServerError("timeout")
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        r2 = _post(client, [{"doc_id": "doc1", "text": "second"}])
+    assert r2.status_code == 502
+    assert r2.headers.get("X-Partial-Write") == "rolled-back"
+
+    # doc0 from first batch must be intact
+    assert store.count(DEFAULT_DS) == 1
+    assert store.get_by_id(DEFAULT_DS, "doc0") is not None
+    assert store.get_by_id(DEFAULT_DS, "doc1") is None
+    assert store.next_row_index(DEFAULT_DS) == 1  # next will get row 1
+
+
+def test_full_ingest_502_response_body_contains_recovery_hint(ingest_client) -> None:
+    """Issue #25 option 3: 502 detail must contain actionable recovery hint."""
+    client, _, mock_arro = ingest_client
+    mock_arro.upload_commit.side_effect = ArroServerError("network error")
+    mock_open, _ = _zarr_mock()
+
+    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
+        r = _post(client, [{"doc_id": "doc0", "text": "hello"}])
+
+    assert r.status_code == 502
+    detail = r.json()["detail"]
+    assert "rolled back" in detail.lower() or "rollback" in detail.lower()
+    assert "re-ingest" in detail.lower() or "safe" in detail.lower()
+
+
+def test_full_ingest_rollback_is_idempotent_if_row_already_absent(
+    ingest_client,
+) -> None:
+    """store.rollback_rows must not raise if row_index is already absent.
+
+    This guards against double-call scenarios (e.g., retry logic or signal
+    handlers calling rollback twice).
+    """
+    _, store, _ = ingest_client
+    result = store.rollback_rows(DEFAULT_DS, [0, 1, 2])
+    assert result == 0
