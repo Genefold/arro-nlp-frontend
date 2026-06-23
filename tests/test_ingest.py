@@ -17,15 +17,11 @@ Tests
 13. Concurrent batches do not overlap row indices
 14. duration_ms is present and non-negative
 15. Metadata round-trips correctly
-16. build_index called when index_stale=True
-17. build_index called for new dataset (metadata returns None)
-18.  Two datasets have independent row indices
-19.  root_label override forwarded to upload_init
-20.  root_label defaults to settings.arro_server_root_label
-21.  Missing dataset_id yields 422
-22.  build_index called even when index_stale=False and is_new=False (issue #26)
-23.  Incremental metadata-only skips build_index
-24.  build_index failure returns 502
+16.  Two datasets have independent row indices
+17.  root_label override forwarded to upload_init
+18.  root_label defaults to settings.arro_server_root_label
+19.  Missing dataset_id yields 422
+20.  Incremental metadata-only skips build_index
 """
 
 from __future__ import annotations
@@ -145,7 +141,7 @@ def test_ingest_arro_sync_called(ingest_client):
 
     mock_arro.upload_init.assert_called_once_with(dataset_id=DEFAULT_DS, root_label="main")
     mock_arro.upload_commit.assert_called_once()
-    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS, timeout=600.0)
+    mock_arro.build_index.assert_not_called()
     assert len(written) == 1
     assert written[0].shape[0] == 1
     assert written[0].dtype == np.float64
@@ -319,64 +315,7 @@ def test_ingest_arro_server_502_leaves_previous_intact(ingest_client):
     assert store.get_by_id(DEFAULT_DS, "doc1") is None
 
 
-# ---------------------------------------------------------------------------
-# Index rebuild scenarios
-# ---------------------------------------------------------------------------
 
-
-def test_ingest_build_index_when_stale(ingest_client):
-    """build_index is called when upload_commit returns index_stale=True."""
-    client, _, mock_arro = ingest_client
-    mock_arro.upload_commit = AsyncMock(
-        return_value=UploadCommitResult(index_stale=True, shape=[1, 384])
-    )
-    mock_open, _ = _zarr_mock()
-    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
-        _post(client, [{"doc_id": "doc0", "text": "hello"}])
-    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS, timeout=600.0)
-
-
-def test_ingest_build_index_when_new_dataset(ingest_client):
-    """build_index is called for new datasets (metadata returns None)."""
-    client, _, mock_arro = ingest_client
-    mock_arro.dataset_metadata = AsyncMock(return_value=None)
-    mock_open, _ = _zarr_mock()
-    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
-        _post(client, [{"doc_id": "doc0", "text": "hello"}])
-    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS, timeout=600.0)
-
-
-# ---------------------------------------------------------------------------
-# Issue #26 regression tests — build_index unconditional on full re-ingest
-# ---------------------------------------------------------------------------
-
-
-def test_full_ingest_calls_build_index_when_index_stale_false_is_new_false(
-    ingest_client,
-) -> None:
-    """Issue #26: build_index must be called even when index_stale=False and is_new=False.
-
-    Scenario: volume was wiped (down -v) and re-created. arro-server reports
-    dataset_metadata → exists (is_new=False), upload_commit → index_stale=False.
-    After the fix, build_index is unconditional on full re-ingest.
-    """
-    client, _, mock_arro = ingest_client
-    mock_arro.dataset_metadata.return_value = {"shape": [0, 384]}  # is_new=False
-    mock_arro.upload_commit.return_value = UploadCommitResult(index_stale=False, shape=[0, 384])
-    mock_open, _ = _zarr_mock()
-    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
-        _post(client, [{"doc_id": "doc0", "text": "hello"}])
-    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS, timeout=600.0)
-
-
-def test_full_ingest_calls_build_index_when_is_new(ingest_client) -> None:
-    """Non-regression: build_index still called when dataset is brand new (is_new=True)."""
-    client, _, mock_arro = ingest_client
-    mock_arro.dataset_metadata.return_value = None  # is_new=True
-    mock_open, _ = _zarr_mock()
-    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
-        _post(client, [{"doc_id": "doc0", "text": "hello"}])
-    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS, timeout=600.0)
 
 
 def test_incremental_ingest_skips_build_index_for_metadata_only(
@@ -406,16 +345,7 @@ def test_incremental_ingest_skips_build_index_for_metadata_only(
     mock_arro.build_index.assert_not_called()
 
 
-def test_full_ingest_returns_502_when_build_index_fails(ingest_client) -> None:
-    """If build_index raises ArroServerError, endpoint returns 502 (not 500)."""
-    client, _, mock_arro = ingest_client
-    mock_arro.build_index.side_effect = ArroServerError("build_index timeout")
-    mock_open, _ = _zarr_mock()
-    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
-        r = _post(client, [{"doc_id": "doc0", "text": "hello"}])
-    assert r.status_code == 502
-    detail = r.json()["detail"]
-    assert "build_index" in detail
+
 
 
 # ---------------------------------------------------------------------------
@@ -641,30 +571,6 @@ def test_full_ingest_pre_commit_failure_upload_init_rolls_back_sqlite(
     assert r.headers.get("X-Partial-Write") == "rolled-back"
     assert store.count(DEFAULT_DS) == 0
     assert store.next_row_index(DEFAULT_DS) == 0
-
-
-def test_full_ingest_post_commit_build_index_failure_does_not_rollback(
-    ingest_client,
-) -> None:
-    """Issue #25: if build_index fails AFTER upload_commit, SQLite must NOT be rolled back.
-
-    Vectors are already on arro-server. Rolling back SQLite would corrupt the
-    dataset (SQLite would say 0 rows, arro-server has N vectors). The header
-    must be 'committed-index-stale', not 'rolled-back'.
-    """
-    client, store, mock_arro = ingest_client
-    mock_arro.build_index.side_effect = ArroServerError("build_index timeout")
-    mock_open, _ = _zarr_mock()
-
-    with patch("arro_nlp_frontend.ingest.zarr.open_array", mock_open):
-        r = _post(client, [{"doc_id": "doc0", "text": "hello"}])
-
-    assert r.status_code == 502
-    assert r.headers.get("X-Partial-Write") == "committed-index-stale"
-    # SQLite must be intact — vectors are on arro-server
-    assert store.count(DEFAULT_DS) == 1
-    assert store.get_by_id(DEFAULT_DS, "doc0") is not None
-    assert store.next_row_index(DEFAULT_DS) == 1  # no rollback
 
 
 def test_full_ingest_pre_commit_failure_batch_of_three_rolls_back_all(
