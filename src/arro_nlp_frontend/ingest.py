@@ -343,21 +343,15 @@ async def _run_incremental_pipeline(
         ) from exc
 
     # ------------------------------------------------------------------
-    # Step 4 -- Rebuild index (outside lock)
+    # Step 4 -- Index build skipped (must be triggered externally after
+    # the full ingest completes — building after every batch is too slow
+    # for 359k records).
     # ------------------------------------------------------------------
     if new_items or changed_items:
-        try:
-            await arro_client.build_index(dataset_id=request.dataset_id, timeout=600.0)
-        except ArroServerError as exc:
-            logger.error(
-                "[ingest][incremental] build_index failed dataset=%s: %s",
-                request.dataset_id,
-                exc,
-            )
-            raise HTTPException(
-                status_code=502,
-                detail=f"arro-server build_index error: {exc}",
-            ) from exc
+        logger.info(
+            "[ingest][incremental] %d new/changed items; index NOT rebuilt automatically",
+            len(new_items) + len(changed_items),
+        )
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     logger.info(
@@ -521,15 +515,9 @@ async def ingest(
             # rolling back SQLite here would corrupt the dataset.
             _upload_committed = True
 
-            # 5e. Always rebuild the index on full re-ingest.
-            # Index builds on large datasets take several minutes; use a
-            # generous per-request timeout to avoid httpx.ReadTimeout.
-            # Unconditional: after a volume wipe (down -v), arro-server can
-            # report index_stale=False (data identical to bulk) and
-            # is_new=False (dataset metadata exists) even though the physical
-            # index is gone.  Calling build_index unconditionally is safe:
-            # if the index is already valid, arro-server returns quickly.
-            await arro_client.build_index(dataset_id=request.dataset_id, timeout=600.0)
+            # 5e. Index build skipped — building after every batch is too
+            # slow for 359k records. Trigger it manually after full ingest:
+            #   curl -X POST .../api/datasets/{id}/index
 
         except ArroServerError as exc:
             if not _upload_committed:
