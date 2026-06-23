@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Tests for POST /ingest with incremental=True.
 
 ALL tests run offline -- no arro-server, no HF Hub downloads.
@@ -14,9 +15,9 @@ Test index
  3. test_incremental_metadata_only_no_embed_no_vector_write
         Pre-existing docs, text unchanged -> neither append nor overwrite
         called; encode_batch NOT called.
- 4. test_incremental_build_index_called_once_for_mixed_batch
-        Mixed batch (new + changed + metadata-only) -> build_index called
-        exactly once.
+ 4. test_incremental_build_index_not_called_for_mixed_batch
+        Mixed batch (new + changed + metadata-only) -> build_index NOT
+        called by the endpoint (scheduler triggers rebuild after all batches).
  5. test_incremental_build_index_not_called_for_metadata_only
         All metadata-only -> build_index NOT called.
  6. test_incremental_consistency_guard_raises_409_on_mismatch
@@ -225,12 +226,16 @@ def test_incremental_metadata_only_no_embed_no_vector_write(ingest_client):
 
 
 # ---------------------------------------------------------------------------
-# 4. build_index called once for mixed batch
+# 4. build_index NOT called for mixed batch (scheduler's responsibility)
 # ---------------------------------------------------------------------------
 
 
-def test_incremental_build_index_called_once_for_mixed_batch(ingest_client):
-    """Mixed batch (new + changed + metadata-only) -> build_index called exactly once."""
+def test_incremental_build_index_not_called_for_mixed_batch(ingest_client):
+    """Mixed batch (new + changed + metadata-only) -> build_index NOT called by endpoint.
+
+    The ingest endpoint no longer triggers index rebuilds. The scheduler
+    calls POST /api/datasets/{id}/index once after all batches complete.
+    """
     client, store, mock_arro = ingest_client
 
     _seed_store(
@@ -256,7 +261,7 @@ def test_incremental_build_index_called_once_for_mixed_batch(ingest_client):
         ],
     )
     assert r.status_code == 200, r.json()
-    mock_arro.build_index.assert_called_once_with(dataset_id=DEFAULT_DS, timeout=600.0)
+    mock_arro.build_index.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
