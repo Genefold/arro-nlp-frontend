@@ -1,7 +1,7 @@
 """POST /ingest endpoint: embed, store in SQLite, and sync to arro-server via Zarr.
 
 Pipeline: validate -> embed (chunked) -> lock -> next_row_index -> persist ->
-          read all vectors -> Zarr rewrite -> upload_commit -> build_index.
+          read all vectors -> Zarr rewrite -> upload_commit.
 """
 
 from __future__ import annotations
@@ -169,9 +169,10 @@ async def _run_incremental_pipeline(
     4. upsert_batch_with_indices for new_items + changed_items (with vectors).
     5. upsert_batch for metadata_items using their existing row_index (no vector write).
 
-    Index rebuild (outside lock)
-    ----------------------------
-    build_index is called once at the end if any new or changed documents exist.
+    Index rebuild
+    -------------
+    build_index is NOT called here. The scheduler triggers a full index
+    rebuild via POST /api/datasets/{id}/index after all batches complete.
 
     Parameters
     ----------
@@ -343,21 +344,15 @@ async def _run_incremental_pipeline(
         ) from exc
 
     # ------------------------------------------------------------------
-    # Step 4 -- Rebuild index (outside lock)
+    # Step 4 -- Index build skipped (must be triggered externally after
+    # the full ingest completes — building after every batch is too slow
+    # for 359k records).
     # ------------------------------------------------------------------
     if new_items or changed_items:
-        try:
-            await arro_client.build_index(dataset_id=request.dataset_id, timeout=600.0)
-        except ArroServerError as exc:
-            logger.error(
-                "[ingest][incremental] build_index failed dataset=%s: %s",
-                request.dataset_id,
-                exc,
-            )
-            raise HTTPException(
-                status_code=502,
-                detail=f"arro-server build_index error: {exc}",
-            ) from exc
+        logger.info(
+            "[ingest][incremental] %d new/changed items; index NOT rebuilt automatically",
+            len(new_items) + len(changed_items),
+        )
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     logger.info(
@@ -411,8 +406,6 @@ async def ingest(
           b. upload_init -> upload_path
           c. Write Zarr v3 array to upload_path
           d. upload_commit
-          e. build_index (always on full re-ingest; see issue #26)
-             On incremental: only if new_items or changed_items exist.
 
     Raises:
       422: duplicate doc_ids within the batch
@@ -474,11 +467,6 @@ async def ingest(
     # Steps 3-5 -- inside the lock: start_row is stable for the duration
     lock = _get_dataset_lock(req.app.state.ingest_locks, request.dataset_id)
 
-    # Track whether upload_commit succeeded so we know whether rollback
-    # is safe (pre-commit failure) or harmful (post-commit, build_index failed).
-    _upload_committed = False
-    _rolled_back = False
-
     async with lock:
         start_row = store.next_row_index(dataset_id=request.dataset_id)
 
@@ -516,74 +504,32 @@ async def ingest(
 
             # 5d. Commit the upload
             await arro_client.upload_commit(dataset_id=request.dataset_id, fs_path=upload_path)
-            # Mark commit as successful BEFORE build_index.
-            # If build_index fails, the vectors are already on the server --
-            # rolling back SQLite here would corrupt the dataset.
-            _upload_committed = True
-
-            # 5e. Always rebuild the index on full re-ingest.
-            # Index builds on large datasets take several minutes; use a
-            # generous per-request timeout to avoid httpx.ReadTimeout.
-            # Unconditional: after a volume wipe (down -v), arro-server can
-            # report index_stale=False (data identical to bulk) and
-            # is_new=False (dataset metadata exists) even though the physical
-            # index is gone.  Calling build_index unconditionally is safe:
-            # if the index is already valid, arro-server returns quickly.
-            await arro_client.build_index(dataset_id=request.dataset_id, timeout=600.0)
 
         except ArroServerError as exc:
-            if not _upload_committed:
-                # Pre-commit failure: arro-server never received the vectors.
-                # Roll back SQLite to restore consistency.
-                rolled_back_count = store.rollback_rows(
-                    request.dataset_id,
-                    list(range(start_row, start_row + len(documents))),
-                )
-                _rolled_back = True
-                logger.error(
-                    "[ingest] arro-server sync failed BEFORE commit "
-                    "dataset=%s start_row=%d rolled_back=%d: %s",
-                    request.dataset_id,
-                    start_row,
-                    rolled_back_count,
-                    exc,
-                )
-                return JSONResponse(
-                    status_code=502,
-                    headers={"X-Partial-Write": "rolled-back"},
-                    content={
-                        "detail": (
-                            f"arro-server sync failed before upload_commit: {exc}. "
-                            "SQLite has been rolled back. "
-                            "Re-ingest is safe — no manual repair needed."
-                        )
-                    },
-                )
-            else:
-                # Post-commit failure: vectors exist on arro-server but index
-                # is not built. SQLite is correct. Do NOT rollback.
-                logger.error(
-                    "[ingest] build_index failed AFTER commit "
-                    "dataset=%s start_row=%d: %s. "
-                    "Data is on arro-server but index may be stale. "
-                    "Re-trigger build_index or re-ingest.",
-                    request.dataset_id,
-                    start_row,
-                    exc,
-                )
-                return JSONResponse(
-                    status_code=502,
-                    headers={"X-Partial-Write": "committed-index-stale"},
-                    content={
-                        "detail": (
-                            f"arro-server build_index failed after successful "
-                            f"upload_commit: {exc}. "
-                            "Vectors are on arro-server but the search index "
-                            "may be stale. Re-ingest to rebuild the index — "
-                            "no data loss."
-                        )
-                    },
-                )
+            # Pre-commit failure: arro-server never received the vectors.
+            # Roll back SQLite to restore consistency.
+            rolled_back_count = store.rollback_rows(
+                request.dataset_id,
+                list(range(start_row, start_row + len(documents))),
+            )
+            logger.error(
+                "[ingest] arro-server sync failed BEFORE commit "
+                "dataset=%s start_row=%d rolled_back=%d: %s",
+                request.dataset_id,
+                start_row,
+                rolled_back_count,
+                exc,
+            )
+            return JSONResponse(
+                status_code=502,
+                headers={"X-Partial-Write": "rolled-back"},
+                content={
+                    "detail": (
+                        f"arro-server sync failed before upload_commit: {exc}. "
+                        "SQLite has been rolled back. Re-ingest is safe."
+                    )
+                },
+            )
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     logger.info(
