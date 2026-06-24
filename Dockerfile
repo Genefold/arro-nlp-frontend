@@ -30,12 +30,15 @@ RUN apt-get update \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # CRITICO: installa PyTorch CPU-only PRIMA di uv sync
-# Questo impedisce a pip/uv di scaricare le CUDA libs (~14GB inutili)
+# Questo impedisce a pip/uv di scaricare le CUDA libs (~14GB inutili su CPU-only server)
 RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# hatchling necessario per --no-build-isolation (build del pacchetto locale)
+RUN pip install hatchling
 
 # ── Deps layer (cached until pyproject.toml or uv.lock changes) ───────────────
 COPY pyproject.toml uv.lock ./
-# --no-build-isolation: riusa il torch CPU-only già installato
+# --no-build-isolation: riusa il torch CPU-only già installato sopra
 RUN uv sync --frozen --no-dev --no-install-project \
     --no-build-isolation
 
