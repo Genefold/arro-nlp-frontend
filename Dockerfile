@@ -39,9 +39,6 @@ COPY README.md ./
 COPY src ./src
 RUN uv sync --frozen --no-dev
 
-# Remove CUDA packages on non-GPU builds
-RUN /app/.venv/bin/pip uninstall -y nvidia-cusparselt-cu13 2>/dev/null || true
-
 # ── Runtime user + dirs ───────────────────────────────────────────────────────
 # /app/data  → SQLite document store (store_db_path default: ./data/documents.sqlite)
 # HF_HOME    → sentence-transformers model cache (mount as named volume in compose)

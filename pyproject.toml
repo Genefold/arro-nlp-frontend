@@ -52,6 +52,7 @@ packages = ["src/arro_nlp_frontend"]
 # and cannot locate the arro_nlp_frontend import root.
 [tool.uv]
 package = true
+index-strategy = "unsafe-best-match"
 
 [tool.ruff]
 line-length = 100
@@ -79,3 +80,10 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
