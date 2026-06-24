@@ -29,24 +29,19 @@ RUN apt-get update \
 # uv — pinned via digest in CI, latest here for simplicity
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-# CRITICO: installa PyTorch CPU-only PRIMA di uv sync
-# Questo impedisce a pip/uv di scaricare le CUDA libs (~14GB inutili su CPU-only server)
-RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-# hatchling necessario per --no-build-isolation (build del pacchetto locale)
-RUN pip install hatchling
+# CRITICO: forza uv a usare il PyTorch CPU-only index
+# Senza questo, uv risolve torch dal PyPI standard e scarica CUDA (~14GB inutili)
+ENV UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
 
 # ── Deps layer (cached until pyproject.toml or uv.lock changes) ───────────────
 COPY pyproject.toml uv.lock ./
-# --no-build-isolation: riusa il torch CPU-only già installato sopra
-RUN uv sync --frozen --no-dev --no-install-project \
-    --no-build-isolation
+RUN uv sync --frozen --no-dev --no-install-project
 
 # ── App source ────────────────────────────────────────────────────────────────
 # README.md needed by hatchling during build (validate_fields checks existence)
 COPY README.md ./
 COPY src ./src
-RUN uv sync --frozen --no-dev --no-build-isolation
+RUN uv sync --frozen --no-dev
 
 # ── Runtime user + dirs ───────────────────────────────────────────────────────
 # /app/data  → SQLite document store (store_db_path default: ./data/documents.sqlite)
