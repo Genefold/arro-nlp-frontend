@@ -52,6 +52,7 @@ packages = ["src/arro_nlp_frontend"]
 # and cannot locate the arro_nlp_frontend import root.
 [tool.uv]
 package = true
+index-strategy = "unsafe-best-match"
 
 [tool.ruff]
 line-length = 100
