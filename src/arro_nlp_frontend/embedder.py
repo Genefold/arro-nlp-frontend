@@ -6,14 +6,18 @@ Design rules (NON NEGOTIABLE):
   - model_path set but missing on disk → FileNotFoundError at construction time.
     Never fall back silently: a silent fallback would mix vector distributions
     in the same Zarr index and corrupt search quality with no error.
+  - model_path set but directory is EMPTY → fall back to HF Hub model with a
+    WARNING. An empty directory means no domain-adapted model has been placed
+    there yet; using the base model is safe because the index is also empty.
   - Empty input returns shape (0, dim), never raises.
   - Logging after every batch: count, mean_norm, min_norm, max_norm, elapsed.
 
 Backend resolution order:
-  1. model_path non-empty AND exists on disk  → SentenceTransformer(model_path)
-  2. model_path non-empty AND missing         → FileNotFoundError (fail loud)
-  3. model_path empty, backend=local          → SentenceTransformer(model) via HF Hub
-  4. backend=openai                           → OpenAI Embeddings API
+  1. model_path non-empty AND exists on disk AND non-empty dir  → SentenceTransformer(model_path)
+  2. model_path non-empty AND exists on disk AND empty dir      → SentenceTransformer(model) via HF Hub (WARNING)
+  3. model_path non-empty AND missing                          → FileNotFoundError (fail loud)
+  4. model_path empty, backend=local                           → SentenceTransformer(model) via HF Hub
+  5. backend=openai                                            → OpenAI Embeddings API
 """
 
 from __future__ import annotations
@@ -35,6 +39,11 @@ try:
     import openai as _openai
 except ImportError:  # pragma: no cover
     _openai = None  # type: ignore[misc, assignment]
+
+
+def _is_empty_dir(p: Path) -> bool:
+    """Return True if *p* is a directory that contains no files (recursively)."""
+    return p.is_dir() and not any(p.rglob("*"))
 
 
 class Embedder:
@@ -88,7 +97,24 @@ class Embedder:
                     raise NotADirectoryError(
                         f"EMBEDDER_MODEL_PATH must be a directory, not a file: {model_path}"
                     )
-                self._model = SentenceTransformer(str(p))
+                if _is_empty_dir(p):
+                    # Volume mount created an empty placeholder directory — no
+                    # domain-adapted model has been deployed yet. Fall back to
+                    # the base HF Hub model so the service starts cleanly.
+                    # WARNING (not ERROR) because this is expected in fresh
+                    # deployments and CI environments.
+                    logger.warning(
+                        "EMBEDDER_MODEL_PATH=%r is an empty directory. "
+                        "No domain-adapted model found — falling back to "
+                        "HF Hub model %r. "
+                        "Place a fine-tuned SentenceTransformer model in that "
+                        "directory and restart to use it.",
+                        model_path,
+                        model,
+                    )
+                    self._model = SentenceTransformer(model)
+                else:
+                    self._model = SentenceTransformer(str(p))
             else:
                 self._model = SentenceTransformer(model)
         else:
