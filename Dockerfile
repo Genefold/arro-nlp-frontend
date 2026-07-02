@@ -47,7 +47,7 @@ RUN uv sync --frozen --no-dev
 # /app/data  → SQLite document store (store_db_path default: ./data/documents.sqlite)
 # HF_HOME    → sentence-transformers model cache (mount as named volume in compose)
 RUN adduser --disabled-password --gecos "" appuser \
-    && mkdir -p /data /app/data /home/appuser/.cache/huggingface \
+    && mkdir -p /data /app/data /home/appuser/.cache/huggingface /app/domain_adapted_model \
     && chown -R appuser:appuser /data /app /home/appuser/.cache
 
 USER appuser
@@ -73,9 +73,9 @@ EXPOSE 8000
 
 # ── Healthcheck ───────────────────────────────────────────────────────────────
 # /health → 200 only after embedder weights are loaded.
-# start_period=90s covers cold HF download.
+# start_period=180s covers cold HF download on slow hosts.
 # With warm hf-model-cache volume, healthy in ~10s.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=5 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=5 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
