@@ -13,11 +13,12 @@ Design rules (NON NEGOTIABLE):
   - Logging after every batch: count, mean_norm, min_norm, max_norm, elapsed.
 
 Backend resolution order:
-  1. model_path non-empty AND exists on disk AND non-empty dir  → SentenceTransformer(model_path)
-  2. model_path non-empty AND exists on disk AND empty dir      → SentenceTransformer(model) via HF Hub (WARNING)
-  3. model_path non-empty AND missing                          → FileNotFoundError (fail loud)
-  4. model_path empty, backend=local                           → SentenceTransformer(model) via HF Hub
-  5. backend=openai                                            → OpenAI Embeddings API
+  1. model_path non-empty AND exists AND non-empty dir → SentenceTransformer(model_path)
+  2. model_path non-empty AND exists AND empty dir     → SentenceTransformer(model) via
+     HF Hub (WARNING)
+  3. model_path non-empty AND missing                 → FileNotFoundError (fail loud)
+  4. model_path empty, backend=local                  → SentenceTransformer(model) via HF Hub
+  5. backend=openai                                   → OpenAI Embeddings API
 """
 
 from __future__ import annotations
