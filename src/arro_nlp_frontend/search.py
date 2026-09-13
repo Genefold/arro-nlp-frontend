@@ -2,7 +2,8 @@
 
 Pipeline:
   1. Validate: non-empty query string                   -> 400 on failure
-  2. Embed query -> float64 vector shape (dim,)          <- synchronous, no lock needed
+  2. Embed query in a worker thread (never the event loop)
+     -> float64 vector shape (dim,)
   3. Call arro-server: POST /api/datasets/{id}/search   -> 502 on failure
   4. For each (index, score) in results:
        doc = store.get_by_row(index)
@@ -12,14 +13,17 @@ Pipeline:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
+import numpy as np
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from arro_nlp_frontend.arro_client import ArroServerError
 from arro_nlp_frontend.config import settings
+from arro_nlp_frontend.embedder import Embedder
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +79,32 @@ class SearchResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Embedding offload
+# ---------------------------------------------------------------------------
+
+
+async def embed_query(embedder: Embedder, query: str) -> np.ndarray:
+    """Embed a single query in a worker thread (issue #126).
+
+    encode_batch is CPU-bound (sentence-transformers inference). Calling it
+    directly in the request coroutine stalls the event loop: /health stops
+    answering and concurrent searches queue behind the inference. asyncio.to_thread
+    keeps the loop responsive without changing the vector, its dtype, or the
+    error semantics (model failures propagate unchanged; the await stays
+    cancellable).
+
+    Thread-safety: the shared Embedder is inference-only after startup --
+    backend, model, OpenAI client and scale_factor are set once in lifespan
+    and never mutated, so concurrent encode_batch calls on the shared instance
+    are safe. No Semaphore: uvicorn runs a single worker and the harness
+    already rate-limits upstream; serialising here would add queueing without
+    telemetry. Revisit only if concurrent inference shows memory pressure on
+    the 2 GB droplet.
+    """
+    return (await asyncio.to_thread(embedder.encode_batch, [query]))[0]
+
+
 @router.post("/search", response_model=SearchResponse, tags=["search"])
 async def search(
     request: SearchRequest,
@@ -84,7 +114,7 @@ async def search(
 
     Pipeline (no lock required -- this is a pure read path):
       1. Validate: non-empty query string
-      2. Embed query -> float64 vector (dim,)
+      2. Embed query in a worker thread -> float64 vector (dim,)
       3. POST /api/datasets/{id}/search with vector, top_k, tau
       4. Hydrate each returned row_index from DocumentStore
          Missing rows are logged and skipped (data inconsistency, not a hard error)
@@ -104,8 +134,10 @@ async def search(
     store = req.app.state.store
     arro_client = req.app.state.arro_client
 
-    # Step 2 -- embed (single vector, no chunking needed)
-    vector = embedder.encode_batch([request.query])[0]
+    # Step 2 -- embed query off the event loop (issue #126)
+    t_embed = time.perf_counter()
+    vector = await embed_query(embedder, request.query)
+    embedding_ms = int((time.perf_counter() - t_embed) * 1000)
 
     # Step 3 -- resolve tau: per-request override, else settings default
     tau = request.tau if request.tau is not None else settings.arro_server_search_tau
@@ -149,11 +181,13 @@ async def search(
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     logger.info(
-        "[search] dataset=%s query=%r top_k=%d tau=%.2f hits=%d hydrated=%d duration_ms=%d",
+        "[search] dataset=%s query=%r top_k=%d tau=%.2f embedding_ms=%d hits=%d "
+        "hydrated=%d duration_ms=%d",
         request.dataset_id,
         request.query[:60],
         request.top_k,
         tau,
+        embedding_ms,
         len(hits),
         len(results),
         elapsed_ms,

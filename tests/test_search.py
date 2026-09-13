@@ -17,17 +17,33 @@ Test inventory:
   12. test_search_dataset_isolation
   13. test_search_missing_dataset_id_422
   14. test_search_dataset_id_forwarded_to_arro_client
+  Issue #126 -- embedding offloaded from the event loop:
+  15. test_search_embedder_called_once_with_query
+  16. test_search_invalid_query_never_reaches_embedder
+  17. test_embed_query_runs_off_event_loop_thread
+  18. test_health_responsive_while_embedding_blocks
+  19. test_search_embedder_error_propagates
+  20. test_embed_query_cancellation_propagates
 """
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
 import numpy as np
 import pytest
+from fastapi import FastAPI
 
-from arro_nlp_frontend.arro_client import ArroServerError, SearchHit
+from arro_nlp_frontend.arro_client import ArroClient, ArroServerError, SearchHit
+from arro_nlp_frontend.embedder import Embedder
+from arro_nlp_frontend.main import create_app
+from arro_nlp_frontend.search import embed_query
 from arro_nlp_frontend.store import Document
 
 DEFAULT_DS = "test/dataset"
@@ -274,3 +290,197 @@ def test_search_dataset_id_forwarded_to_arro_client(search_client):
     call_args = mock_arro.search.call_args
     assert "dataset_id" in call_args.kwargs
     assert call_args.kwargs["dataset_id"] == "nvd/embeddings"
+
+
+# ---------------------------------------------------------------------------
+# Issue #126 -- embedding inference offloaded from the event loop
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def _noop_lifespan(app: FastAPI):  # pragma: no cover -- trivial context manager
+    yield
+
+
+def _fake_embedder(encode_impl) -> Mock:
+    """Mock(spec=Embedder) whose encode_batch is driven by `encode_impl`.
+
+    `encode_impl` may be a plain sync callable or an exception instance
+    (Mock raises it when called). The mock must stay SYNCHRONOUS: the
+    endpoint offloads it via asyncio.to_thread, so an AsyncMock would
+    bypass the code under test.
+    """
+    fake = Mock(spec=Embedder)
+    fake.encode_batch = Mock(side_effect=encode_impl)
+    fake.dim = 384
+    return fake
+
+
+def _build_app(fake_embedder: Mock) -> FastAPI:
+    """Standalone app for async (event-loop level) tests, lifespan patched out."""
+    with patch("arro_nlp_frontend.main.lifespan", _noop_lifespan):
+        app = create_app()
+    app.state.embedder = fake_embedder
+    app.state.store = Mock()
+    app.state.arro_client = AsyncMock(spec=ArroClient)
+    app.state.arro_client.search = AsyncMock(return_value=[])
+    app.state.ingest_locks = {}
+    return app
+
+
+async def _wait_for_thread_event(evt: threading.Event, timeout: float = 2.0) -> None:
+    """Await a threading.Event from the event loop with a generous CI-safe timeout."""
+
+    async def _poll() -> None:
+        while not evt.is_set():
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(_poll(), timeout=timeout)
+
+
+def test_search_embedder_called_once_with_query(search_client):
+    """One valid query produces exactly one sync encode_batch([query]) call (#126).
+
+    The embedder mock stays synchronous: inference is offloaded by the endpoint
+    via asyncio.to_thread, so the correct assertion is a plain call-count
+    check, not an await check.
+    """
+    client, store, mock_arro = search_client
+    fake = _fake_embedder(lambda queries: np.ones((len(queries), 384)))
+    client.app.state.embedder = fake
+    _seed_store(store, [(0, "doc0", "Buffer overflow in OpenSSL")])
+    mock_arro.search = AsyncMock(return_value=[SearchHit(index=0, score=0.9)])
+
+    r = _post(client, "buffer overflow")
+
+    assert r.status_code == 200
+    fake.encode_batch.assert_called_once_with(["buffer overflow"])
+
+
+def test_search_invalid_query_never_reaches_embedder(search_client):
+    """400 validation fires before the embedder is touched (#126)."""
+    client, _, _ = search_client
+    fake = _fake_embedder(lambda queries: np.ones((len(queries), 384)))
+    client.app.state.embedder = fake
+
+    assert _post(client, "").status_code == 400
+    assert _post(client, "   ").status_code == 400
+
+    fake.encode_batch.assert_not_called()
+
+
+async def test_embed_query_runs_off_event_loop_thread():
+    """encode_batch must execute outside the event loop thread (#126).
+
+    Direct regression guard against someone removing the to_thread offload:
+    the fake records the thread it ran on and the test asserts it is not the
+    caller's thread.
+    """
+    caller_thread = threading.get_ident()
+    encode_threads: list[int] = []
+
+    def encode_impl(queries: list[str]) -> np.ndarray:
+        encode_threads.append(threading.get_ident())
+        return np.ones((len(queries), 384))
+
+    fake = _fake_embedder(encode_impl)
+
+    vector = await embed_query(fake, "query")
+
+    assert len(encode_threads) == 1
+    assert encode_threads[0] != caller_thread
+    assert vector.shape == (384,)
+
+
+def _blocking_encode(started: threading.Event, release: threading.Event, deadline_s: float = 6.0):
+    """Sync encoder that spins in its calling thread until released or deadline.
+
+    The deadline bounds the spin: on the pre-#126 code the encoder runs on the
+    event loop and would otherwise block it forever (wait_for timers can never
+    fire inside a synchronous spin), hanging the test suite instead of failing
+    it. With the deadline the regression surfaces as a TimeoutError failure.
+    """
+
+    def _encode(queries: list[str]) -> np.ndarray:
+        started.set()
+        t_end = time.monotonic() + deadline_s
+        while not release.is_set() and time.monotonic() < t_end:
+            time.sleep(0.001)
+        return np.ones((len(queries), 384))
+
+    return _encode
+
+
+async def test_health_responsive_while_embedding_blocks():
+    """A blocked inference must not stall the event loop or /health (#126).
+
+    The search endpoint runs with an encoder that spins in a worker thread
+    until released. While it is blocked, /health must still answer -- this
+    is exactly the failure mode the offload fixes (the old synchronous call
+    starved the loop and made the Docker healthcheck time out).
+    Timing is coordinated with threading events and wait_for guards, not
+    wall-clock sleeps, so it is stable on slow CI.
+    """
+    started = threading.Event()
+    release = threading.Event()
+    app = _build_app(_fake_embedder(_blocking_encode(started, release)))
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        search_task = asyncio.create_task(
+            http.post("/search", json={"dataset_id": "d/s", "query": "q", "top_k": 1})
+        )
+        try:
+            await _wait_for_thread_event(started)
+
+            health_resp = await asyncio.wait_for(http.get("/health"), timeout=2.0)
+            assert health_resp.status_code == 200
+        finally:
+            # Always unblock the worker: on the pre-#126 code the health check
+            # times out and fails the test, but the encoder thread and the
+            # in-flight request must still be released so the client can close.
+            release.set()
+
+        search_resp = await asyncio.wait_for(search_task, timeout=5.0)
+        assert search_resp.status_code == 200
+
+
+def test_search_embedder_error_propagates(search_client):
+    """An embedder failure surfaces unchanged -- never an empty success (#126).
+
+    The endpoint deliberately does not catch inference errors: they propagate
+    to the server's generic 500 handling. With raise_server_exceptions=True
+    the RuntimeError reaches the test, proving it is not swallowed and not
+    converted into a 200 with empty results.
+    """
+    client, _, mock_arro = search_client
+    fake = _fake_embedder(RuntimeError("model exploded"))
+    client.app.state.embedder = fake
+
+    with pytest.raises(RuntimeError, match="model exploded"):
+        _post(client, "buffer overflow")
+
+    mock_arro.search.assert_not_called()
+
+
+async def test_embed_query_cancellation_propagates():
+    """Cancelling the request cancels the coroutine-side wait (#126).
+
+    A sync function already entered in a worker thread cannot be interrupted
+    (Python cannot kill threads safely) -- the guarantee here is that the
+    awaiting coroutine observes the cancellation and stops processing the
+    response. The worker is always released in finally so the default
+    executor is not left with a spinning thread for other tests.
+    """
+    started = threading.Event()
+    release = threading.Event()
+    fake = _fake_embedder(_blocking_encode(started, release))
+
+    task = asyncio.create_task(embed_query(fake, "query"))
+    await _wait_for_thread_event(started)
+    task.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
