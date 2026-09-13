@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from typing import cast
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Request
@@ -102,7 +103,9 @@ async def embed_query(embedder: Embedder, query: str) -> np.ndarray:
     telemetry. Revisit only if concurrent inference shows memory pressure on
     the 2 GB droplet.
     """
-    return (await asyncio.to_thread(embedder.encode_batch, [query]))[0]
+    encoded = await asyncio.to_thread(embedder.encode_batch, [query])
+    # numpy stubs type __getitem__ as Any -- make the ndarray boundary explicit
+    return cast(np.ndarray, encoded[0])
 
 
 @router.post("/search", response_model=SearchResponse, tags=["search"])
