@@ -364,8 +364,7 @@ class DocumentStore:
             [dataset_id, *unique_indices],
         )
         return {
-            doc.row_index: doc
-            for doc in (self._row_to_document(row) for row in cursor.fetchall())
+            doc.row_index: doc for doc in (self._row_to_document(row) for row in cursor.fetchall())
         }
 
     def get_by_id(self, dataset_id: str, doc_id: str) -> Document | None:

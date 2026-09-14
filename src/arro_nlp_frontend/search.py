@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field, SerializeAsAny, model_validator
 from arro_nlp_frontend.arro_client import ArroServerError
 from arro_nlp_frontend.config import settings
 from arro_nlp_frontend.embedder import Embedder
+from arro_nlp_frontend.store import Document
 
 logger = logging.getLogger(__name__)
 
@@ -84,13 +85,12 @@ class SearchRequest(BaseModel):
     comparison_tau: float | None = Field(
         None,
         description=(
-            "Required only when compare=true. 0.42 selects spectral and "
-            "0.70 selects hybrid."
+            "Required only when compare=true. 0.42 selects spectral and 0.70 selects hybrid."
         ),
     )
 
     @model_validator(mode="after")
-    def _validate_compare_mode(self) -> "SearchRequest":
+    def _validate_compare_mode(self) -> SearchRequest:
         if not self.compare:
             if self.comparison_tau is not None:
                 raise ValueError("comparison_tau requires compare=true")
@@ -100,9 +100,7 @@ class SearchRequest(BaseModel):
         if effective_tau != COSINE_TAU:
             raise ValueError("compare mode requires cosine baseline tau=1.0")
         if self.comparison_tau not in COMPARE_VARIANT_TAUS:
-            raise ValueError(
-                "comparison_tau must be 0.42 (spectral) or 0.70 (hybrid)"
-            )
+            raise ValueError("comparison_tau must be 0.42 (spectral) or 0.70 (hybrid)")
         if self.top_k > MAX_COMPARE_K:
             raise ValueError(f"compare mode supports top_k up to {MAX_COMPARE_K}")
         return self
@@ -199,7 +197,7 @@ async def embed_query(embedder: Embedder, query: str) -> np.ndarray:
 
 def _hydrate_hits(
     hits,
-    documents_by_row: dict[int, object],
+    documents_by_row: dict[int, Document | None],
 ) -> list[SearchResult]:
     """Build ranked results from hits and a batch-fetched document map.
 
@@ -295,7 +293,9 @@ def _build_compare_response(
         variant=ModeResults(
             mode=variant_mode,
             tau=variant_tau,
-            results=variant_items,
+            # SerializeAsAny keeps the subclass rank-delta fields in the output;
+            # list invariance requires the explicit cast.
+            results=cast("list[SerializeAsAny[SearchResult]]", variant_items),
         ),
         comparison=summary,
         query_time_ms=0,
@@ -357,9 +357,7 @@ async def search(
                 tau=tau,
             )
         else:
-            variant_mode = (
-                "spectral" if request.comparison_tau == SPECTRAL_TAU else "hybrid"
-            )
+            variant_mode = "spectral" if request.comparison_tau == SPECTRAL_TAU else "hybrid"
             baseline_hits = await arro_client.search(
                 dataset_id=request.dataset_id,
                 vector=vector,
@@ -404,9 +402,7 @@ async def search(
 
     # Compare mode: ONE batch query over the stable union of row indices.
     row_indices = list(
-        dict.fromkeys(
-            [hit.index for hit in baseline_hits] + [hit.index for hit in variant_hits]
-        )
+        dict.fromkeys([hit.index for hit in baseline_hits] + [hit.index for hit in variant_hits])
     )
     documents_by_row = store.get_by_rows(request.dataset_id, row_indices)
     baseline_results = _hydrate_hits(baseline_hits, documents_by_row)
