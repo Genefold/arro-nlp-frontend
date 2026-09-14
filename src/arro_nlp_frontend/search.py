@@ -197,30 +197,26 @@ async def embed_query(embedder: Embedder, query: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-async def _hydrate_hits(
-    store,
-    dataset_id: str,
+def _hydrate_hits(
     hits,
-    cache: dict[int, object | None],
+    documents_by_row: dict[int, object],
 ) -> list[SearchResult]:
-    """Hydrate hits from the store, de-duplicating by doc_id (first wins).
+    """Build ranked results from hits and a batch-fetched document map.
 
-    ``cache`` is shared across the two compare branches so each unique row
-    index is fetched from the store exactly once (batch-hydration property:
-    one pass over the stable union, not per-branch lookups).
+    De-duplicates by doc_id (first occurrence wins) so arro-server's
+    ordering cannot surface the same identity twice; ranks are assigned
+    AFTER de-duplication so 1..N stays contiguous. Missing rows are
+    logged and skipped (data inconsistency, not a hard error); hydration
+    never reorders hits.
 
-    Missing rows are logged and skipped (data inconsistency, not a hard
-    error). Ranks are assigned AFTER de-duplication, so rank 1..N stays
-    contiguous; hydration never reorders hits.
+    Single mode fetches via store.get_by_row per hit (unchanged legacy
+    path); compare mode fetches the stable union of row indices with ONE
+    store.get_by_rows query (#131).
     """
     hydrated: list[SearchResult] = []
     seen_doc_ids: set[str] = set()
     for hit in hits:
-        if hit.index not in cache:
-            cache[hit.index] = store.get_by_row(
-                dataset_id=dataset_id, row_index=hit.index
-            )
-        doc = cache[hit.index]
+        doc = documents_by_row.get(hit.index)
         if doc is None:
             logger.warning(
                 "[search] row_index=%d returned by arro-server not found in store "
@@ -383,10 +379,13 @@ async def search(
             detail=f"arro-server error: {exc}",
         ) from exc
 
-    # Step 4 -- hydrate from store (one pass over the union of hit rows)
-    cache: dict[int, object | None] = {}
+    # Step 4 -- hydrate from store
     if not request.compare:
-        results = await _hydrate_hits(store, request.dataset_id, hits, cache)
+        documents_by_row = {
+            hit.index: store.get_by_row(dataset_id=request.dataset_id, row_index=hit.index)
+            for hit in hits
+        }
+        results = _hydrate_hits(hits, documents_by_row)
 
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         logger.info(
@@ -403,9 +402,15 @@ async def search(
         )
         return SearchResponse(results=results, query_time_ms=elapsed_ms)
 
-    # Compare mode: hydrate both lists against one shared cache.
-    baseline_results = await _hydrate_hits(store, request.dataset_id, baseline_hits, cache)
-    variant_results = await _hydrate_hits(store, request.dataset_id, variant_hits, cache)
+    # Compare mode: ONE batch query over the stable union of row indices.
+    row_indices = list(
+        dict.fromkeys(
+            [hit.index for hit in baseline_hits] + [hit.index for hit in variant_hits]
+        )
+    )
+    documents_by_row = store.get_by_rows(request.dataset_id, row_indices)
+    baseline_results = _hydrate_hits(baseline_hits, documents_by_row)
+    variant_results = _hydrate_hits(variant_hits, documents_by_row)
     response = _build_compare_response(
         baseline_results,
         variant_results,

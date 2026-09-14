@@ -567,18 +567,22 @@ def test_compare_hybrid_tau_070(search_client):
 
 
 def test_compare_metadata_batch_hydration(search_client):
-    """Shared-row hits are fetched from the store exactly once (union batch)."""
+    """The union of hit rows is fetched with ONE store.get_by_rows query (#131)."""
     client, store, mock_arro = search_client
     _seed_compare_store(store, [(0, "CVE-A", "a"), (1, "CVE-B", "b"), (2, "CVE-C", "c")])
 
-    get_by_row_calls: list[int] = []
-    real_get_by_row = store.get_by_row
+    get_by_rows_calls: list[list[int]] = []
+    real_get_by_rows = store.get_by_rows
 
-    def _counting_get_by_row(*, dataset_id, row_index):
-        get_by_row_calls.append(row_index)
-        return real_get_by_row(dataset_id=dataset_id, row_index=row_index)
+    def _counting_get_by_rows(dataset_id, row_indices):
+        get_by_rows_calls.append(list(row_indices))
+        return real_get_by_rows(dataset_id, row_indices)
 
-    store.get_by_row = _counting_get_by_row
+    store.get_by_rows = _counting_get_by_rows
+    # Compare mode must not fall back to per-row point lookups.
+    store.get_by_row = Mock(
+        side_effect=AssertionError("compare mode must use get_by_rows, not get_by_row")
+    )
 
     _install_two_search_mock(
         mock_arro,
@@ -590,7 +594,9 @@ def test_compare_metadata_batch_hydration(search_client):
     r = _compare_post(client, 0.42)
 
     assert r.status_code == 200
-    assert sorted(get_by_row_calls) == [0, 1, 2]  # each unique row fetched once
+    # Exactly one batch lookup over the stable first-seen union [0, 1, 2, ...]
+    assert len(get_by_rows_calls) == 1
+    assert get_by_rows_calls[0] == [0, 1, 2]
 
 
 def test_compare_rank_statuses_and_kpis(search_client):
@@ -655,9 +661,7 @@ def test_compare_dedupes_duplicate_doc_ids(search_client):
         2: SimpleNamespace(doc_id="CVE-2", text="x", metadata={}),
     }
     store = Mock()
-    store.get_by_row = Mock(
-        side_effect=lambda *, dataset_id, row_index: docs.get(row_index)
-    )
+    store.get_by_rows = Mock(return_value=docs)
     client.app.state.store = store
 
     _install_two_search_mock(
@@ -670,10 +674,12 @@ def test_compare_dedupes_duplicate_doc_ids(search_client):
     r = _compare_post(client, 0.42)
 
     assert r.status_code == 200
+    store.get_by_rows.assert_called_once()
+    assert store.get_by_rows.call_args.args[0] == DEFAULT_DS
+    assert store.get_by_rows.call_args.args[1] == [0, 1, 2]  # stable union, no repeats
     baseline = r.json()["baseline"]["results"]
     assert [res["rank"] for res in baseline] == [1, 2]
     assert [res["row_index"] for res in baseline] == [0, 2]  # first occurrence kept
-    assert store.get_by_row.call_count == 3  # one lookup per unique row in the union
 
 
 def test_compare_variant_failure_is_atomic(search_client):
