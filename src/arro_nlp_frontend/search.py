@@ -362,22 +362,22 @@ async def search(
 ):
     """Embed query text, retrieve ranked results from arro-server, hydrate from store.
 
-    Pipeline (no lock required -- this is a pure read path):
-      1. Validate: non-empty query string
-      2. Embed query in a worker thread -> float64 vector (dim,)  [exactly once]
-      3. POST /api/datasets/{id}/search with vector, top_k, tau
-         (comparison: two sequential searches, tau=1.0 then the selected
-          variant tau, against the same resident dataset; search_mode is
-          the canonical selector, legacy compare/comparison_tau accepted)
-      4. Hydrate returned row_indices from DocumentStore
-         Missing rows are logged and skipped (data inconsistency, not a hard error)
-5. Return ranked, hydrated results (comparison: baseline + variant
-          columns with rank deltas and overlap KPIs)
+        Pipeline (no lock required -- this is a pure read path):
+          1. Validate: non-empty query string
+          2. Embed query in a worker thread -> float64 vector (dim,)  [exactly once]
+          3. POST /api/datasets/{id}/search with vector, top_k, tau
+             (comparison: two sequential searches, tau=1.0 then the selected
+              variant tau, against the same resident dataset; search_mode is
+              the canonical selector, legacy compare/comparison_tau accepted)
+          4. Hydrate returned row_indices from DocumentStore
+             Missing rows are logged and skipped (data inconsistency, not a hard error)
+    5. Return ranked, hydrated results (comparison: baseline + variant
+              columns with rank deltas and overlap KPIs)
 
-    Raises:
-      400: query is empty or whitespace-only
-      422: invalid search_mode / legacy compare parameters
-      502: arro-server unreachable or returned non-2xx
+        Raises:
+          400: query is empty or whitespace-only
+          422: invalid search_mode / legacy compare parameters
+          502: arro-server unreachable or returned non-2xx
     """
     t0 = time.perf_counter()
 
