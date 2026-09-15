@@ -797,3 +797,113 @@ def test_compare_absent_keeps_single_mode_shape(search_client):
     body = r.json()
     assert set(body.keys()) == {"results", "query_time_ms"}
     assert body["results"][0]["doc_id"] == "CVE-1"
+
+
+# Revised #131/#132 spec -- canonical search_mode contract
+# ---------------------------------------------------------------------------
+
+
+def _mode_post(client, search_mode: str, top_k: int = 3) -> httpx.Response:
+    return client.post(
+        "/search",
+        json={
+            "dataset_id": DEFAULT_DS,
+            "query": "buffer overflow",
+            "top_k": top_k,
+            "search_mode": search_mode,
+        },
+    )
+
+
+def test_search_mode_spectral_maps_to_tau_042(search_client):
+    client, store, mock_arro = search_client
+    _seed_compare_store(store, [(0, "CVE-1", "a"), (1, "CVE-2", "b")])
+    fake = _fake_embedder(lambda queries: np.ones((len(queries), 384)))
+    client.app.state.embedder = fake
+
+    calls = _install_two_search_mock(
+        mock_arro,
+        [SearchHit(index=0, score=0.9)],
+        [SearchHit(index=1, score=0.8)],
+        tau_order=[1.0, 0.42],
+    )
+
+    r = _mode_post(client, "spectral")
+
+    assert r.status_code == 200
+    fake.encode_batch.assert_called_once_with(["buffer overflow"])
+    assert mock_arro.search.call_count == 2
+    assert calls[0]["tau"] == pytest.approx(1.0)
+    assert calls[1]["tau"] == pytest.approx(0.42)
+    assert calls[0]["vector"] is calls[1]["vector"]
+    body = r.json()
+    assert body["variant"]["mode"] == "spectral"
+    assert body["variant"]["tau"] == pytest.approx(0.42)
+    assert body["baseline"]["mode"] == "cosine"
+    assert body["baseline"]["tau"] == pytest.approx(1.0)
+
+
+def test_search_mode_hybrid_maps_to_tau_070(search_client):
+    client, store, mock_arro = search_client
+    _seed_compare_store(store, [(0, "CVE-1", "a")])
+
+    calls = _install_two_search_mock(
+        mock_arro,
+        [SearchHit(index=0, score=0.9)],
+        [SearchHit(index=0, score=0.8)],
+        tau_order=[1.0, 0.70],
+    )
+
+    r = _mode_post(client, "hybrid")
+
+    assert r.status_code == 200
+    assert calls[1]["tau"] == pytest.approx(0.70)
+    assert r.json()["variant"]["mode"] == "hybrid"
+
+
+def test_search_mode_invalid_rejected(search_client):
+    client, _, _ = search_client
+    r = client.post(
+        "/search",
+        json={"dataset_id": DEFAULT_DS, "query": "q", "search_mode": "cosine"},
+    )
+    assert r.status_code == 422
+
+
+def test_search_mode_with_legacy_fields_rejected(search_client):
+    client, _, _ = search_client
+    r = client.post(
+        "/search",
+        json={
+            "dataset_id": DEFAULT_DS,
+            "query": "q",
+            "search_mode": "spectral",
+            "compare": True,
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_search_mode_unknown_extra_field_rejected(search_client):
+    """#132: lam/alpha stay out of the downstream contract."""
+    client, _, _ = search_client
+    r = client.post(
+        "/search",
+        json={"dataset_id": DEFAULT_DS, "query": "q", "lam": 0.7},
+    )
+    assert r.status_code == 422
+
+
+def test_search_mode_tau_100_variant_rejected(search_client):
+    """tau=1.0 is the baseline, never a user-selected variant."""
+    client, _, _ = search_client
+    r = client.post(
+        "/search",
+        json={
+            "dataset_id": DEFAULT_DS,
+            "query": "q",
+            "search_mode": "spectral",
+            "tau": 0.42,
+        },
+    )
+    assert r.status_code == 422

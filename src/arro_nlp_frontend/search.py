@@ -10,10 +10,12 @@ Pipeline (single mode):
        if doc is None: log warning + skip (data inconsistency, do not 500)
   5. Return SearchResponse { results, query_time_ms }
 
-Pipeline (compare mode, issue #131):
+Pipeline (comparison mode, revised #131/#132 spec):
   1. Embed the query exactly once.
   2. Search the SAME resident dataset twice, sequentially:
-     tau=1.0 (cosine baseline) and comparison_tau (0.42 spectral / 0.70 hybrid).
+     tau=1.0 (cosine baseline) and the selected ArrowSpace variant
+     (spectral 0.42 / hybrid 0.70), selected by search_mode or the legacy
+     comparison_tau field (deprecated, normalized on arrival).
   3. Hydrate metadata once over the stable union of hit row indices.
   4. Compute per-variant rank deltas and overlap KPIs server-side.
   5. Return CompareSearchResponse — atomic: any failed branch fails the
@@ -25,11 +27,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import cast
+from typing import Literal, cast
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field, SerializeAsAny, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, model_validator
 
 from arro_nlp_frontend.arro_client import ArroServerError
 from arro_nlp_frontend.config import settings
@@ -40,12 +42,22 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Search-mode tau constants (issue #131). Cosine is the product default;
-# spectral and hybrid exist only as approved comparison variants.
+# Search-mode constants (revised #131/#132 spec). Cosine (tau=1.0) is the
+# comparison baseline only; the public contract is search_mode. The backend
+# is authoritative for mode -> tau interpretation.
 COSINE_TAU = 1.0
 SPECTRAL_TAU = 0.42
 HYBRID_TAU = 0.70
 COMPARE_VARIANT_TAUS = frozenset({SPECTRAL_TAU, HYBRID_TAU})
+_MODE_BY_VARIANT_TAU = {SPECTRAL_TAU: "spectral", HYBRID_TAU: "hybrid"}
+MODE_TO_TAU: dict[str, float] = {"spectral": SPECTRAL_TAU, "hybrid": HYBRID_TAU}
+MODE_LABELS: dict[str, str] = {
+    "spectral": "Spectral search",
+    "hybrid": "Hybrid search",
+}
+BASELINE_MODE = "cosine"
+BASELINE_TAU = COSINE_TAU
+DEFAULT_PRODUCT_MODE = "spectral"
 MAX_COMPARE_K = 20
 
 
@@ -55,7 +67,15 @@ MAX_COMPARE_K = 20
 
 
 class SearchRequest(BaseModel):
-    """Request body for POST /search."""
+    """Request body for POST /search.
+
+    Canonical contract: ``search_mode`` selects the ArrowSpace variant
+    (``spectral`` | ``hybrid``); the cosine baseline always runs alongside.
+    ``compare``/``comparison_tau`` are deprecated #131 legacy fields,
+    normalized to the same internal representation until migration ends.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     dataset_id: str = Field(
         ...,
@@ -73,37 +93,66 @@ class SearchRequest(BaseModel):
             "0.42 = spectral-aware, 0.70 = hybrid, 1.00 = pure cosine."
         ),
     )
+    search_mode: Literal["spectral", "hybrid"] | None = Field(
+        None,
+        description=(
+            "ArrowSpace product mode. Mutually exclusive with legacy "
+            "compare/comparison_tau. Selects the variant searched against "
+            "the cosine baseline."
+        ),
+    )
     compare: bool = Field(
         False,
         description=(
-            "When true, return a cosine baseline (tau=1.0) and one approved "
-            "ArrowSpace comparison variant in a single response. The query "
-            "is embedded once and both searches run against the same "
-            "resident dataset."
+            "DEPRECATED (#132): legacy compare flag, normalized to "
+            "search_mode. When true, return a cosine baseline (tau=1.0) and "
+            "one approved ArrowSpace comparison variant in a single "
+            "response. The query is embedded once and both searches run "
+            "against the same resident dataset."
         ),
     )
     comparison_tau: float | None = Field(
         None,
         description=(
-            "Required only when compare=true. 0.42 selects spectral and 0.70 selects hybrid."
+            "DEPRECATED (#132): required only with legacy compare=true. "
+            "0.42 selects spectral and 0.70 selects hybrid."
         ),
     )
 
     @model_validator(mode="after")
     def _validate_compare_mode(self) -> SearchRequest:
-        if not self.compare:
-            if self.comparison_tau is not None:
-                raise ValueError("comparison_tau requires compare=true")
-            return self
+        if self.search_mode is not None:
+            if self.compare or self.comparison_tau is not None:
+                raise ValueError(
+                    "search_mode is mutually exclusive with legacy compare/comparison_tau"
+                )
+            if self.tau is not None and self.tau != COSINE_TAU:
+                raise ValueError("search_mode requires cosine baseline tau=1.0")
+            self.tau = COSINE_TAU
+            self.compare = True
+            self.comparison_tau = MODE_TO_TAU[self.search_mode]
+        elif self.compare:
+            if self.comparison_tau is None:
+                raise ValueError("compare mode requires comparison_tau")
+        elif self.comparison_tau is not None:
+            raise ValueError("comparison_tau requires compare=true")
 
-        effective_tau = COSINE_TAU if self.tau is None else self.tau
-        if effective_tau != COSINE_TAU:
-            raise ValueError("compare mode requires cosine baseline tau=1.0")
-        if self.comparison_tau not in COMPARE_VARIANT_TAUS:
-            raise ValueError("comparison_tau must be 0.42 (spectral) or 0.70 (hybrid)")
-        if self.top_k > MAX_COMPARE_K:
-            raise ValueError(f"compare mode supports top_k up to {MAX_COMPARE_K}")
+        if self.compare:
+            effective_tau = COSINE_TAU if self.tau is None else self.tau
+            if effective_tau != COSINE_TAU:
+                raise ValueError("compare mode requires cosine baseline tau=1.0")
+            if self.comparison_tau not in COMPARE_VARIANT_TAUS:
+                raise ValueError("comparison_tau must be 0.42 (spectral) or 0.70 (hybrid)")
+            if self.top_k > MAX_COMPARE_K:
+                raise ValueError(f"compare mode supports top_k up to {MAX_COMPARE_K}")
         return self
+
+    @property
+    def variant_mode(self) -> str:
+        """Selected ArrowSpace variant (never 'cosine')."""
+        if self.search_mode is not None:
+            return self.search_mode
+        return _MODE_BY_VARIANT_TAU[self.comparison_tau]  # type: ignore[index]
 
 
 class SearchResult(BaseModel):
@@ -317,16 +366,17 @@ async def search(
       1. Validate: non-empty query string
       2. Embed query in a worker thread -> float64 vector (dim,)  [exactly once]
       3. POST /api/datasets/{id}/search with vector, top_k, tau
-         (compare=true: two sequential searches, tau=1.0 then comparison_tau,
-          against the same resident dataset)
+         (comparison: two sequential searches, tau=1.0 then the selected
+          variant tau, against the same resident dataset; search_mode is
+          the canonical selector, legacy compare/comparison_tau accepted)
       4. Hydrate returned row_indices from DocumentStore
          Missing rows are logged and skipped (data inconsistency, not a hard error)
-      5. Return ranked, hydrated results (compare=true: baseline + variant
-         columns with rank deltas and overlap KPIs)
+5. Return ranked, hydrated results (comparison: baseline + variant
+          columns with rank deltas and overlap KPIs)
 
     Raises:
       400: query is empty or whitespace-only
-      422: invalid compare parameters
+      422: invalid search_mode / legacy compare parameters
       502: arro-server unreachable or returned non-2xx
     """
     t0 = time.perf_counter()
@@ -357,7 +407,7 @@ async def search(
                 tau=tau,
             )
         else:
-            variant_mode = "spectral" if request.comparison_tau == SPECTRAL_TAU else "hybrid"
+            variant_mode = request.variant_mode
             baseline_hits = await arro_client.search(
                 dataset_id=request.dataset_id,
                 vector=vector,
