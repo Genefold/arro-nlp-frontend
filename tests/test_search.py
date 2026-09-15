@@ -484,3 +484,316 @@ async def test_embed_query_cancellation_propagates():
             await task
     finally:
         release.set()
+
+
+# ---------------------------------------------------------------------------
+# Issue #131 -- single-request cosine + ArrowSpace comparison search
+# ---------------------------------------------------------------------------
+
+
+def _compare_post(client, comparison_tau: float, top_k: int = 3) -> httpx.Response:
+    return client.post(
+        "/search",
+        json={
+            "dataset_id": DEFAULT_DS,
+            "query": "buffer overflow",
+            "top_k": top_k,
+            "compare": True,
+            "comparison_tau": comparison_tau,
+        },
+    )
+
+
+def _seed_compare_store(store, docs: list[tuple[int, str, str]]) -> None:
+    _seed_store(store, docs)
+
+
+def _install_two_search_mock(mock_arro, cosine_hits, variant_hits, tau_order):
+    """Route mock_arro.search by tau: returns hits per configured tau order."""
+    calls: list[dict] = []
+
+    async def _search(**kwargs):
+        calls.append(kwargs)
+        tau = kwargs["tau"]
+        expected_tau = tau_order[len(calls) - 1]
+        assert tau == pytest.approx(expected_tau)
+        return cosine_hits if tau == pytest.approx(1.0) else variant_hits
+
+    mock_arro.search = AsyncMock(side_effect=_search)
+    return calls
+
+
+def test_compare_spectral_one_embedding_two_searches(search_client):
+    """One embedding, two searches (tau 1.0 then 0.42), same vector (#131)."""
+    client, store, mock_arro = search_client
+    _seed_compare_store(store, [(0, "CVE-1", "a"), (1, "CVE-2", "b"), (2, "CVE-3", "c")])
+    fake = _fake_embedder(lambda queries: np.ones((len(queries), 384)))
+    client.app.state.embedder = fake
+
+    calls = _install_two_search_mock(
+        mock_arro,
+        [SearchHit(index=0, score=0.9), SearchHit(index=1, score=0.8)],
+        [SearchHit(index=1, score=0.85), SearchHit(index=2, score=0.7)],
+        tau_order=[1.0, 0.42],
+    )
+
+    r = _compare_post(client, 0.42)
+
+    assert r.status_code == 200
+    fake.encode_batch.assert_called_once_with(["buffer overflow"])
+    assert mock_arro.search.call_count == 2
+    assert calls[0]["tau"] == pytest.approx(1.0)
+    assert calls[1]["tau"] == pytest.approx(0.42)
+    assert calls[0]["vector"] is calls[1]["vector"]
+    assert all(c["dataset_id"] == DEFAULT_DS for c in calls)
+
+
+def test_compare_hybrid_tau_070(search_client):
+    client, store, mock_arro = search_client
+    _seed_compare_store(store, [(0, "CVE-1", "a"), (1, "CVE-2", "b")])
+
+    calls = _install_two_search_mock(
+        mock_arro,
+        [SearchHit(index=0, score=0.9)],
+        [SearchHit(index=1, score=0.8)],
+        tau_order=[1.0, 0.70],
+    )
+
+    r = _compare_post(client, 0.70)
+
+    assert r.status_code == 200
+    assert calls[0]["tau"] == pytest.approx(1.0)
+    assert calls[1]["tau"] == pytest.approx(0.70)
+
+
+def test_compare_metadata_batch_hydration(search_client):
+    """The union of hit rows is fetched with ONE store.get_by_rows query (#131)."""
+    client, store, mock_arro = search_client
+    _seed_compare_store(store, [(0, "CVE-A", "a"), (1, "CVE-B", "b"), (2, "CVE-C", "c")])
+
+    get_by_rows_calls: list[list[int]] = []
+    real_get_by_rows = store.get_by_rows
+
+    def _counting_get_by_rows(dataset_id, row_indices):
+        get_by_rows_calls.append(list(row_indices))
+        return real_get_by_rows(dataset_id, row_indices)
+
+    store.get_by_rows = _counting_get_by_rows
+    # Compare mode must not fall back to per-row point lookups.
+    store.get_by_row = Mock(
+        side_effect=AssertionError("compare mode must use get_by_rows, not get_by_row")
+    )
+
+    _install_two_search_mock(
+        mock_arro,
+        [SearchHit(index=0, score=0.9), SearchHit(index=1, score=0.8), SearchHit(index=2, score=0.7)],
+        [SearchHit(index=2, score=0.85), SearchHit(index=0, score=0.75)],
+        tau_order=[1.0, 0.42],
+    )
+
+    r = _compare_post(client, 0.42)
+
+    assert r.status_code == 200
+    # Exactly one batch lookup over the stable first-seen union [0, 1, 2, ...]
+    assert len(get_by_rows_calls) == 1
+    assert get_by_rows_calls[0] == [0, 1, 2]
+
+
+def test_compare_rank_statuses_and_kpis(search_client):
+    """up/down/new/unchanged statuses, deltas and overlap KPIs are correct."""
+    client, store, mock_arro = search_client
+    _seed_compare_store(
+        store,
+        [
+            (0, "CVE-Z", "z"),
+            (1, "CVE-X", "x"),
+            (2, "CVE-Q", "q"),
+            (3, "CVE-V", "v"),
+            (4, "CVE-Y", "y"),
+            (5, "CVE-W", "w"),
+        ],
+    )
+    # Cosine:    Z(1) X(2) Q(3) V(4) Y(5)
+    # Spectral:  Y(1) X(2) Z(3) W(4)
+    _install_two_search_mock(
+        mock_arro,
+        [SearchHit(0, 0.9), SearchHit(1, 0.8), SearchHit(2, 0.7), SearchHit(3, 0.6), SearchHit(4, 0.5)],
+        [SearchHit(4, 0.95), SearchHit(1, 0.85), SearchHit(0, 0.8), SearchHit(5, 0.75)],
+        tau_order=[1.0, 0.42],
+    )
+
+    r = _compare_post(client, 0.42, top_k=5)
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["baseline"]["mode"] == "cosine"
+    assert body["variant"]["mode"] == "spectral"
+
+    items = body["variant"]["results"]
+    by_id = {item["doc_id"]: item for item in items}
+    assert by_id["CVE-Y"]["rank_status"] == "up" and by_id["CVE-Y"]["rank_delta"] == 4
+    assert by_id["CVE-X"]["rank_status"] == "unchanged" and by_id["CVE-X"]["rank_delta"] == 0
+    assert by_id["CVE-Z"]["rank_status"] == "down" and by_id["CVE-Z"]["rank_delta"] == -2
+    assert by_id["CVE-W"]["rank_status"] == "new" and by_id["CVE-W"]["baseline_rank"] is None
+
+    cmp = body["comparison"]
+    assert cmp["overlap_count"] == 3  # X, Y, Z
+    assert cmp["overlap_ratio"] == pytest.approx(3 / 5)  # denominator = requested k
+    assert cmp["promoted_count"] == 1
+    assert cmp["demoted_count"] == 1
+    assert cmp["unchanged_count"] == 1
+    assert cmp["new_count"] == 1
+    assert cmp["dropped_count"] == 2  # Q, V
+
+
+def test_compare_dedupes_duplicate_doc_ids(search_client):
+    """Duplicate doc_ids within a list keep the first occurrence, ranks stay 1..N.
+
+    Uses a mock store: the real DocumentStore cannot hold the same doc_id at
+    two row indices, and arro-server may still surface duplicate identities.
+    """
+    client, _, mock_arro = search_client
+    from types import SimpleNamespace
+
+    docs = {
+        0: SimpleNamespace(doc_id="CVE-1", text="first", metadata={}),
+        1: SimpleNamespace(doc_id="CVE-1", text="second", metadata={}),
+        2: SimpleNamespace(doc_id="CVE-2", text="x", metadata={}),
+    }
+    store = Mock()
+    store.get_by_rows = Mock(return_value=docs)
+    client.app.state.store = store
+
+    _install_two_search_mock(
+        mock_arro,
+        [SearchHit(index=0, score=0.9), SearchHit(index=1, score=0.85), SearchHit(index=2, score=0.8)],
+        [SearchHit(index=0, score=0.9)],
+        tau_order=[1.0, 0.42],
+    )
+
+    r = _compare_post(client, 0.42)
+
+    assert r.status_code == 200
+    store.get_by_rows.assert_called_once()
+    assert store.get_by_rows.call_args.args[0] == DEFAULT_DS
+    assert store.get_by_rows.call_args.args[1] == [0, 1, 2]  # stable union, no repeats
+    baseline = r.json()["baseline"]["results"]
+    assert [res["rank"] for res in baseline] == [1, 2]
+    assert [res["row_index"] for res in baseline] == [0, 2]  # first occurrence kept
+
+
+def test_compare_variant_failure_is_atomic(search_client):
+    """Second search fails -> whole comparison fails 502, no partial payload."""
+    client, store, mock_arro = search_client
+    _seed_compare_store(store, [(0, "CVE-1", "a")])
+
+    async def _search(**kwargs):
+        if kwargs["tau"] == pytest.approx(1.0):
+            return [SearchHit(index=0, score=0.9)]
+        raise ArroServerError("variant search failed")
+
+    mock_arro.search = AsyncMock(side_effect=_search)
+
+    r = _compare_post(client, 0.42)
+
+    assert r.status_code == 502
+    assert mock_arro.search.call_count == 2
+
+
+def test_compare_ghost_rows_do_not_mutate_ranks(search_client):
+    """Ghost rows are skipped; ranks stay contiguous and deltas reference real ids."""
+    client, store, mock_arro = search_client
+    _seed_compare_store(store, [(0, "CVE-1", "a"), (2, "CVE-2", "b")])
+
+    _install_two_search_mock(
+        mock_arro,
+        [SearchHit(index=0, score=0.9), SearchHit(index=1, score=0.8), SearchHit(index=2, score=0.7)],
+        [SearchHit(index=2, score=0.9), SearchHit(index=3, score=0.8)],
+        tau_order=[1.0, 0.42],
+    )
+
+    r = _compare_post(client, 0.42)
+
+    assert r.status_code == 200
+    body = r.json()
+    # cosine list: ghost row 1 skipped -> ranks 1..2
+    assert [(res["doc_id"], res["rank"]) for res in body["baseline"]["results"]] == [
+        ("CVE-1", 1),
+        ("CVE-2", 2),
+    ]
+    # variant: row 2 present, ghost row 3 skipped -> up by one position
+    variant = body["variant"]["results"]
+    assert len(variant) == 1
+    assert variant[0]["rank_status"] == "up"
+    assert variant[0]["baseline_rank"] == 2  # cosine rank of CVE-2
+
+
+def test_compare_missing_comparison_tau_422(search_client):
+    client, _, _ = search_client
+    r = client.post(
+        "/search",
+        json={"dataset_id": DEFAULT_DS, "query": "q", "compare": True},
+    )
+    assert r.status_code == 422
+
+
+def test_compare_non_cosine_tau_422(search_client):
+    client, _, _ = search_client
+    r = client.post(
+        "/search",
+        json={
+            "dataset_id": DEFAULT_DS,
+            "query": "q",
+            "tau": 0.42,
+            "compare": True,
+            "comparison_tau": 0.42,
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_compare_unsupported_comparison_tau_422(search_client):
+    client, _, _ = search_client
+    r = client.post(
+        "/search",
+        json={"dataset_id": DEFAULT_DS, "query": "q", "compare": True, "comparison_tau": 0.5},
+    )
+    assert r.status_code == 422
+
+
+def test_compare_top_k_above_cap_422(search_client):
+    client, _, _ = search_client
+    r = client.post(
+        "/search",
+        json={
+            "dataset_id": DEFAULT_DS,
+            "query": "q",
+            "top_k": 21,
+            "compare": True,
+            "comparison_tau": 0.42,
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_comparison_tau_without_compare_422(search_client):
+    client, _, _ = search_client
+    r = client.post(
+        "/search",
+        json={"dataset_id": DEFAULT_DS, "query": "q", "comparison_tau": 0.42},
+    )
+    assert r.status_code == 422
+
+
+def test_compare_absent_keeps_single_mode_shape(search_client):
+    """compare omitted -> existing flat {results, query_time_ms} response."""
+    client, store, mock_arro = search_client
+    _seed_store(store, [(0, "CVE-1", "a")])
+    mock_arro.search = AsyncMock(return_value=[SearchHit(index=0, score=0.9)])
+
+    r = _post(client, "q")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body.keys()) == {"results", "query_time_ms"}
+    assert body["results"][0]["doc_id"] == "CVE-1"

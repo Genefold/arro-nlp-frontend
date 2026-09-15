@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     regardless — this only overrides the path used for the local
     Zarr write and the subsequent upload_commit body.
     """
-    arro_server_search_tau: float = 0.42
+    arro_server_search_tau: float = 1.0
 
     # ── Document store ─────────────────────────────────────────────────────────
     store_db_path: str = "./data/documents.sqlite"

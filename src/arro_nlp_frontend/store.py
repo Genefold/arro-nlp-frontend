@@ -339,6 +339,34 @@ class DocumentStore:
         row = cursor.fetchone()
         return self._row_to_document(row) if row else None
 
+    def get_by_rows(
+        self,
+        dataset_id: str,
+        row_indices: list[int],
+    ) -> dict[int, Document]:
+        """Return documents for multiple row_indices in ONE SQL query.
+
+        Used by compare-mode batch hydration (#131): the harness may
+        request up to 2k unique rows (cosine top-k union variant top-k),
+        and issuing 40 individual point lookups from the async endpoint
+        adds avoidable tail latency on the small VM. Missing rows are
+        simply absent from the returned mapping (callers treat them as
+        ghosts, same contract as get_by_row returning None).
+        """
+        unique_indices = list(dict.fromkeys(row_indices))
+        if not unique_indices:
+            return {}
+        assert self._conn is not None
+        placeholders = ",".join("?" * len(unique_indices))
+        cursor = self._conn.execute(
+            "SELECT row_index, doc_id, text, metadata, ingested_at"
+            f" FROM documents WHERE dataset_id = ? AND row_index IN ({placeholders})",
+            [dataset_id, *unique_indices],
+        )
+        return {
+            doc.row_index: doc for doc in (self._row_to_document(row) for row in cursor.fetchall())
+        }
+
     def get_by_id(self, dataset_id: str, doc_id: str) -> Document | None:
         """Return the document with the given doc_id for the dataset, or None if not found."""
         assert self._conn is not None
