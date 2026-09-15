@@ -907,3 +907,30 @@ def test_search_mode_tau_100_variant_rejected(search_client):
         },
     )
     assert r.status_code == 422
+
+
+def test_compare_truncates_hits_to_top_k(search_client):
+    """arro-server taumode returns build-topk rows regardless of k; the
+    endpoint must truncate score-ordered hits to top_k for both columns."""
+    client, store, mock_arro = search_client
+    _seed_compare_store(
+        store,
+        [(i, f"CVE-{i}", "x") for i in range(8)],
+    )
+
+    _install_two_search_mock(
+        mock_arro,
+        [SearchHit(index=i, score=1.0 - i * 0.01) for i in range(8)],
+        [SearchHit(index=i, score=0.9 - i * 0.01) for i in range(8)],
+        tau_order=[1.0, 0.42],
+    )
+
+    r = _mode_post(client, "spectral", top_k=3)
+
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["baseline"]["results"]) == 3
+    assert len(body["variant"]["results"]) == 3
+    # Truncation keeps the highest-scored rows in order
+    assert [res["row_index"] for res in body["baseline"]["results"]] == [0, 1, 2]
+    assert body["comparison"]["k"] == 3

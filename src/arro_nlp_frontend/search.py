@@ -396,30 +396,41 @@ async def search(
     embedding_ms = int((time.perf_counter() - t_embed) * 1000)
 
     # Step 3 -- call arro-server
+    # NOTE: arro-server's taumode search ignores the requested k (it returns
+    # the index build-time topk, 30 rows on the current index). Hits come
+    # back score-ordered, so truncating here enforces this endpoint's
+    # "maximum results" contract for both modes. Remove the slices when
+    # arro-server forwards k to arrowspace search (it accepts a k= override).
     try:
         if not request.compare:
             # Resolve tau: per-request override, else settings default (cosine)
             tau = request.tau if request.tau is not None else settings.arro_server_search_tau
-            hits = await arro_client.search(
-                dataset_id=request.dataset_id,
-                vector=vector,
-                top_k=request.top_k,
-                tau=tau,
-            )
+            hits = (
+                await arro_client.search(
+                    dataset_id=request.dataset_id,
+                    vector=vector,
+                    top_k=request.top_k,
+                    tau=tau,
+                )
+            )[: request.top_k]
         else:
             variant_mode = request.variant_mode
-            baseline_hits = await arro_client.search(
-                dataset_id=request.dataset_id,
-                vector=vector,
-                top_k=request.top_k,
-                tau=COSINE_TAU,
-            )
-            variant_hits = await arro_client.search(
-                dataset_id=request.dataset_id,
-                vector=vector,
-                top_k=request.top_k,
-                tau=request.comparison_tau,
-            )
+            baseline_hits = (
+                await arro_client.search(
+                    dataset_id=request.dataset_id,
+                    vector=vector,
+                    top_k=request.top_k,
+                    tau=COSINE_TAU,
+                )
+            )[: request.top_k]
+            variant_hits = (
+                await arro_client.search(
+                    dataset_id=request.dataset_id,
+                    vector=vector,
+                    top_k=request.top_k,
+                    tau=request.comparison_tau,
+                )
+            )[: request.top_k]
     except ArroServerError as exc:
         logger.error("[search] arro-server search failed: %s", exc)
         raise HTTPException(
